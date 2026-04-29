@@ -1,15 +1,7 @@
 """
-rl_grpo_2hop.py  (refined)
+rl_grpo_2hop.py  (v2: chain_binary reward + scheduler fix + diagnostics)
 
 GRPO fine-tuning for MuSiQue 2-hop bridge-aware training.
-
-主要修订：
-- num_ppo_epochs: 单/多 epoch 切换
-- disable_std_norm: Dr.GRPO 选项
-- eval_during_training: 训练中评估
-- NaN/Inf 安全
-- 更细粒度 logging
-- best checkpoint by smoothed reward
 """
 
 import argparse
@@ -61,10 +53,8 @@ def format_user_content(example: Dict, include_bridge_count: bool = False) -> st
         title = p.get("title", "")
         text = p.get("text", p.get("paragraph_text", ""))
         parts.append(f"Passage Title: {title}\nPassage: {text}")
-
     ctx = "\n\n".join(parts)
     question = example["question"]
-
     if include_bridge_count:
         n_bridge = len(example.get("bridges", []))
         count_hint = (
@@ -74,19 +64,14 @@ def format_user_content(example: Dict, include_bridge_count: bool = False) -> st
         )
     else:
         count_hint = ""
-
     return f"{ctx}\n\nQuestion: {question}{count_hint}"
 
 
 def build_prompt(tokenizer, example: Dict, include_bridge_count: bool = False) -> str:
     messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
-        {
-            "role": "user",
-            "content": format_user_content(
-                example, include_bridge_count=include_bridge_count
-            ),
-        },
+        {"role": "user",
+         "content": format_user_content(example, include_bridge_count=include_bridge_count)},
     ]
     return tokenizer.apply_chat_template(
         messages, tokenize=False, add_generation_prompt=True
@@ -115,7 +100,7 @@ class JsonlDataset(Dataset):
         return self.items[idx]
 
 
-def collate_examples(batch: List[Dict]) -> List[Dict]:
+def collate_examples(batch):
     return batch
 
 
@@ -123,23 +108,19 @@ def collate_examples(batch: List[Dict]) -> List[Dict]:
 # QA metrics
 # ============================================================
 
-def normalize_answer(s: str) -> str:
+def normalize_answer(s):
     if s is None:
         return ""
-
     def remove_articles(text):
         return re.sub(r"\b(a|an|the)\b", " ", text)
-
     def white_space_fix(text):
         return " ".join(text.split())
-
     def remove_punc(text):
         return "".join(ch for ch in text if ch not in set(string.punctuation))
-
     return white_space_fix(remove_articles(remove_punc(s.lower())))
 
 
-def _f1_pair(pred: str, gold: str) -> float:
+def _f1_pair(pred, gold):
     p_toks = normalize_answer(pred).split()
     g_toks = normalize_answer(gold).split()
     if not p_toks or not g_toks:
@@ -153,14 +134,14 @@ def _f1_pair(pred: str, gold: str) -> float:
     return 2 * precision * recall / (precision + recall)
 
 
-def f1_score(pred: str, golds: List[str]) -> float:
+def f1_score(pred, golds):
     golds = [g for g in golds if g]
     if not golds:
         return 0.0
     return max(_f1_pair(pred, g) for g in golds)
 
 
-def em_score(pred: str, golds: List[str]) -> float:
+def em_score(pred, golds):
     p = normalize_answer(pred)
     golds = [g for g in golds if g]
     if not golds:
@@ -168,7 +149,7 @@ def em_score(pred: str, golds: List[str]) -> float:
     return float(any(p == normalize_answer(g) for g in golds))
 
 
-def get_final_golds(example: Dict) -> List[str]:
+def get_final_golds(example):
     golds = []
     if example.get("final_answer"):
         golds.append(example["final_answer"])
@@ -187,7 +168,7 @@ RE_BRIDGE = re.compile(r"^\s*Bridge\s*(\d+)?\s*[:：]\s*(.+?)\s*$", re.IGNORECAS
 RE_ANSWER = re.compile(r"^\s*Answer\s*[:：]\s*(.+?)\s*$", re.IGNORECASE)
 
 
-def clean_field(s: str) -> str:
+def clean_field(s):
     if s is None:
         return ""
     s = s.strip()
@@ -205,60 +186,43 @@ class ParsedOutput:
     raw_nonempty_lines: int
 
 
-def parse_output(text: str) -> ParsedOutput:
-    bridges = []
-    answer = ""
-    events = []
+def parse_output(text):
+    bridges, events, answer = [], [], ""
     last_nonempty = ""
     n_nonempty = 0
-
     for raw in text.strip().splitlines():
         line = raw.strip()
         if not line:
             continue
         n_nonempty += 1
         last_nonempty = line
-
         mb = RE_BRIDGE.match(line)
         if mb:
             bridges.append(clean_field(mb.group(2)))
             events.append("bridge")
             continue
-
         ma = RE_ANSWER.match(line)
         if ma:
             if not answer:
                 answer = clean_field(ma.group(1))
             events.append("answer")
             continue
-
     if not answer and last_nonempty:
         answer = clean_field(last_nonempty)
-
     has_bridge = len(bridges) > 0
     has_answer = "answer" in events
-
     bridge_before_answer = False
     if has_bridge and has_answer:
-        first_bridge_idx = events.index("bridge")
-        first_answer_idx = events.index("answer")
-        bridge_before_answer = first_bridge_idx < first_answer_idx
-
-    return ParsedOutput(
-        bridges=bridges,
-        answer=answer,
-        has_bridge_line=has_bridge,
-        has_answer_line=has_answer,
-        bridge_before_answer=bridge_before_answer,
-        raw_nonempty_lines=n_nonempty,
-    )
+        bridge_before_answer = events.index("bridge") < events.index("answer")
+    return ParsedOutput(bridges, answer, has_bridge, has_answer,
+                        bridge_before_answer, n_nonempty)
 
 
 # ============================================================
 # Reward
 # ============================================================
 
-def compute_bridge_score(pred_bridges: List[str], gold_bridges: List[str]) -> float:
+def compute_bridge_score(pred_bridges, gold_bridges):
     if not gold_bridges:
         return 1.0
     if not pred_bridges:
@@ -271,7 +235,7 @@ def compute_bridge_score(pred_bridges: List[str], gold_bridges: List[str]) -> fl
     return sum(scores) / len(scores)
 
 
-def compute_format_score(parsed: ParsedOutput, n_gold_bridges: int) -> float:
+def compute_format_score(parsed, n_gold_bridges):
     score = 0.0
     if parsed.has_bridge_line:
         score += 0.25
@@ -289,15 +253,8 @@ def compute_format_score(parsed: ParsedOutput, n_gold_bridges: int) -> float:
     return min(score, 1.0)
 
 
-def compute_reward(
-    text: str,
-    example: Dict,
-    reward_mode: str,
-    w_format: float,
-    w_bridge: float,
-    w_final: float,
-    bridge_gate_floor: float,
-) -> Tuple[float, Dict[str, float]]:
+def compute_reward(text, example, reward_mode,
+                   w_format, w_bridge, w_final, bridge_gate_floor):
     parsed = parse_output(text)
     gold_bridges = example.get("bridges", [])
     final_golds = get_final_golds(example)
@@ -307,11 +264,24 @@ def compute_reward(
     answer_em = em_score(parsed.answer, final_golds)
     format_score = compute_format_score(parsed, len(gold_bridges))
 
-    final_effective = answer_f1 * (
-        bridge_gate_floor + (1.0 - bridge_gate_floor) * bridge_score
-    )
-
-    if reward_mode == "process_final":
+    # ---- chain_binary: 完全做对才给 1.0, 否则 cap 0.85 ----
+    if reward_mode == "chain_binary":
+        bridge_threshold = 0.5
+        bridge_pass = float(bridge_score >= bridge_threshold)
+        chain_correct = float(answer_em == 1.0 and bridge_pass == 1.0)
+        if chain_correct == 1.0:
+            reward = 1.0
+        else:
+            partial = (
+                0.10 * format_score
+                + 0.45 * bridge_score
+                + 0.30 * answer_f1 * bridge_score
+            )
+            reward = min(partial, 0.85)
+    elif reward_mode == "process_final":
+        final_effective = answer_f1 * (
+            bridge_gate_floor + (1.0 - bridge_gate_floor) * bridge_score
+        )
         denom = max(w_format + w_bridge + w_final, 1e-8)
         reward = (
             w_format * format_score
@@ -329,13 +299,17 @@ def compute_reward(
 
     reward = float(max(0.0, min(1.0, reward)))
 
+    # 计算严格 chain_em (供日志)
+    bridge_pass_strict = float(bridge_score >= 0.5)
+    chain_em_strict = float(answer_em == 1.0 and bridge_pass_strict == 1.0)
+
     comps = {
         "reward": reward,
         "format": float(format_score),
         "bridge": float(bridge_score),
         "answer_f1": float(answer_f1),
         "answer_em": float(answer_em),
-        "final_effective": float(final_effective),
+        "chain_em": float(chain_em_strict),
         "n_pred_bridge": float(len(parsed.bridges)),
         "n_gold_bridge": float(len(gold_bridges)),
         "has_answer_line": float(parsed.has_answer_line),
@@ -347,7 +321,7 @@ def compute_reward(
 # Tokenizer / EOS helpers
 # ============================================================
 
-def load_tokenizer_safely(path: str, fix_mistral_regex: bool):
+def load_tokenizer_safely(path, fix_mistral_regex):
     kwargs = {"trust_remote_code": True}
     if fix_mistral_regex:
         kwargs["fix_mistral_regex"] = True
@@ -362,7 +336,7 @@ def load_tokenizer_safely(path: str, fix_mistral_regex: bool):
     return tokenizer
 
 
-def get_eos_ids(tokenizer) -> Optional[List[int]]:
+def get_eos_ids(tokenizer):
     eos_ids = []
     if tokenizer.eos_token_id is not None:
         eos_ids.append(int(tokenizer.eos_token_id))
@@ -418,7 +392,6 @@ def generate_completions(model, tokenizer, prompts, args, accelerator):
 
     prompt_len = inputs["input_ids"].shape[1]
     new_tokens = sequences[:, prompt_len:]
-
     texts = tokenizer.batch_decode(
         new_tokens, skip_special_tokens=True, clean_up_tokenization_spaces=False
     )
@@ -432,7 +405,6 @@ def generate_completions(model, tokenizer, prompts, args, accelerator):
     unwrapped.config.use_cache = False
     if was_training:
         unwrapped.train()
-
     return sequences, attention_mask, completion_mask, texts
 
 
@@ -446,25 +418,20 @@ def token_logprobs(model, input_ids, attention_mask):
     return torch.cat([zero, gathered], dim=1)
 
 
-def masked_mean(x, mask, eps: float = 1e-8):
+def masked_mean(x, mask, eps=1e-8):
     return (x * mask).sum() / mask.sum().clamp(min=eps)
 
 
-def compute_grpo_loss(
-    model, ref_model, sequences, attention_mask, completion_mask,
-    advantages, old_logps, args,
-):
+def compute_grpo_loss(model, ref_model, sequences, attention_mask, completion_mask,
+                      advantages, old_logps, args):
     new_logps = token_logprobs(model, sequences, attention_mask)
-
     log_ratio = new_logps - old_logps
-    log_ratio = torch.clamp(log_ratio, -20.0, 20.0)  # NaN/Inf 防护
+    log_ratio = torch.clamp(log_ratio, -20.0, 20.0)
     ratio = torch.exp(log_ratio)
     clipped_ratio = torch.clamp(ratio, 1.0 - args.clip_range, 1.0 + args.clip_range)
 
     adv = advantages.view(-1, 1)
-    pg_loss_1 = -adv * ratio
-    pg_loss_2 = -adv * clipped_ratio
-    pg_loss = torch.max(pg_loss_1, pg_loss_2)
+    pg_loss = torch.max(-adv * ratio, -adv * clipped_ratio)
     pg_loss = masked_mean(pg_loss, completion_mask)
 
     if ref_model is not None and args.kl_beta > 0:
@@ -498,10 +465,8 @@ def compute_grpo_loss(
 @torch.no_grad()
 def quick_eval(model, tokenizer, eval_examples, args, accelerator,
                max_eval_examples=None):
-    """Greedy 评估一小批 dev 样本。仅在 main process 跑。"""
     if not accelerator.is_main_process:
         return None
-
     unwrapped = accelerator.unwrap_model(model)
     unwrapped.eval()
     unwrapped.config.use_cache = True
@@ -509,24 +474,17 @@ def quick_eval(model, tokenizer, eval_examples, args, accelerator,
     if max_eval_examples is not None:
         eval_examples = eval_examples[:max_eval_examples]
 
-    em_sum = 0.0
-    f1_sum = 0.0
-    bridge_sum = 0.0
-
+    em_sum, f1_sum, bridge_sum, chain_em_sum = 0.0, 0.0, 0.0, 0.0
     bs = 4
     for i in range(0, len(eval_examples), bs):
         batch = eval_examples[i : i + bs]
-        prompts = [build_prompt(tokenizer, ex, include_bridge_count=False) for ex in batch]
-
+        prompts = [build_prompt(tokenizer, ex,
+                                include_bridge_count=args.include_bridge_count)
+                   for ex in batch]
         inputs = tokenizer(
-            prompts,
-            return_tensors="pt",
-            padding=True,
-            truncation=True,
-            max_length=args.max_input_len,
-            add_special_tokens=False,
+            prompts, return_tensors="pt", padding=True, truncation=True,
+            max_length=args.max_input_len, add_special_tokens=False,
         ).to(accelerator.device)
-
         out = unwrapped.generate(
             input_ids=inputs["input_ids"],
             attention_mask=inputs["attention_mask"],
@@ -538,21 +496,25 @@ def quick_eval(model, tokenizer, eval_examples, args, accelerator,
         )
         prompt_len = inputs["input_ids"].shape[1]
         new = tokenizer.batch_decode(out[:, prompt_len:], skip_special_tokens=True)
-
         for ex, txt in zip(batch, new):
             parsed = parse_output(txt.strip())
             golds = get_final_golds(ex)
-            em_sum += em_score(parsed.answer, golds)
-            f1_sum += f1_score(parsed.answer, golds)
-            bridge_sum += compute_bridge_score(parsed.bridges, ex.get("bridges", []))
+            em = em_score(parsed.answer, golds)
+            f1 = f1_score(parsed.answer, golds)
+            bs_ = compute_bridge_score(parsed.bridges, ex.get("bridges", []))
+            em_sum += em
+            f1_sum += f1
+            bridge_sum += bs_
+            chain_em_sum += float(em == 1.0 and bs_ >= 0.5)
 
     n = len(eval_examples)
     unwrapped.config.use_cache = False
     return {
-        "eval_em":     em_sum / n * 100,
-        "eval_f1":     f1_sum / n * 100,
-        "eval_bridge": bridge_sum / n * 100,
-        "eval_n":      n,
+        "eval_em":       em_sum / n * 100,
+        "eval_f1":       f1_sum / n * 100,
+        "eval_bridge":   bridge_sum / n * 100,
+        "eval_chain_em": chain_em_sum / n * 100,
+        "eval_n":        n,
     }
 
 
@@ -560,7 +522,7 @@ def quick_eval(model, tokenizer, eval_examples, args, accelerator,
 # Logging / saving
 # ============================================================
 
-def gather_mean(accelerator, value: float) -> float:
+def gather_mean(accelerator, value):
     t = torch.tensor([value], device=accelerator.device, dtype=torch.float32)
     g = accelerator.gather_for_metrics(t)
     return float(g.mean().detach().cpu())
@@ -589,7 +551,6 @@ def save_checkpoint(accelerator, model, tokenizer, output_dir, step_name):
 
 def parse_args():
     p = argparse.ArgumentParser()
-
     p.add_argument("--model_name_or_path", type=str, required=True)
     p.add_argument("--ref_model_name_or_path", type=str, default=None)
     p.add_argument("--train_file", type=str, default="prepared_data_2hop/train_2hop.jsonl")
@@ -601,8 +562,7 @@ def parse_args():
     p.add_argument("--max_steps", type=int, default=400)
     p.add_argument("--per_device_train_batch_size", type=int, default=2)
     p.add_argument("--gradient_accumulation_steps", type=int, default=4)
-    p.add_argument("--num_ppo_epochs", type=int, default=1,
-                   help="每个 rollout 复用几次（>1 时 PPO clip 才真正生效）")
+    p.add_argument("--num_ppo_epochs", type=int, default=1)
     p.add_argument("--learning_rate", type=float, default=5e-7)
     p.add_argument("--warmup_ratio", type=float, default=0.03)
     p.add_argument("--weight_decay", type=float, default=0.0)
@@ -616,36 +576,35 @@ def parse_args():
     # Generation
     p.add_argument("--num_generations", type=int, default=4)
     p.add_argument("--max_input_len", type=int, default=2048)
-    p.add_argument("--max_new_tokens", type=int, default=96)
-    p.add_argument("--temperature", type=float, default=0.8)
+    p.add_argument("--max_new_tokens", type=int, default=128)
+    p.add_argument("--temperature", type=float, default=0.9)
     p.add_argument("--top_p", type=float, default=0.95)
     p.add_argument("--top_k", type=int, default=0)
 
     # GRPO / PPO
     p.add_argument("--clip_range", type=float, default=0.2)
     p.add_argument("--kl_beta", type=float, default=0.02)
-    p.add_argument("--disable_std_norm", action="store_true",
-                   help="Dr.GRPO: 不用 std 归一化")
+    p.add_argument("--disable_std_norm", action="store_true")
 
     # Reward
-    p.add_argument("--reward_mode", type=str, default="process_final",
-                   choices=["process_final", "final_only", "process_only", "format_only"])
+    p.add_argument("--reward_mode", type=str, default="chain_binary",
+                   choices=["chain_binary", "process_final", "final_only",
+                            "process_only", "format_only"])
     p.add_argument("--w_format", type=float, default=0.10)
     p.add_argument("--w_bridge", type=float, default=0.45)
     p.add_argument("--w_final", type=float, default=0.45)
-    p.add_argument("--bridge_gate_floor", type=float, default=0.15)
+    p.add_argument("--bridge_gate_floor", type=float, default=0.0)
 
     # Eval-during-training
     p.add_argument("--eval_file", type=str, default="prepared_data_2hop/eval_2hop.jsonl")
-    p.add_argument("--eval_steps", type=int, default=50)
+    p.add_argument("--eval_steps", type=int, default=100)
     p.add_argument("--eval_subset_size", type=int, default=200)
 
     # Misc
     p.add_argument("--logging_steps", type=int, default=10)
     p.add_argument("--save_steps", type=int, default=100)
     p.add_argument("--save_best", action="store_true", default=True)
-    p.add_argument("--fix_mistral_regex", action="store_true",
-                   help="保持和 SFT 一致：默认 False。")
+    p.add_argument("--fix_mistral_regex", action="store_true")
     return p.parse_args()
 
 
@@ -699,7 +658,7 @@ def main():
             p_.requires_grad_(False)
 
     train_ds = JsonlDataset(args.train_file, limit=args.limit_train_examples)
-    accelerator.print(f"Loaded {len(train_ds)} training examples")
+    accelerator.print(f"Loaded {len(train_ds)} training examples from {args.train_file}")
 
     eval_examples = []
     if args.eval_file and os.path.exists(args.eval_file):
@@ -728,12 +687,17 @@ def main():
         eps=1e-8,
         weight_decay=args.weight_decay,
     )
+
+    # ★ FIX: 多卡下 accelerate 会把 scheduler.step() 调用 num_processes 次,
+    #   把 num_training_steps 乘上 num_processes 让 cosine 周期对齐
+    n_proc = accelerator.num_processes
     warmup_steps = int(args.max_steps * args.warmup_ratio)
     scheduler = get_cosine_schedule_with_warmup(
         optimizer,
-        num_warmup_steps=warmup_steps,
-        num_training_steps=args.max_steps,
+        num_warmup_steps=warmup_steps * n_proc,
+        num_training_steps=args.max_steps * n_proc,
     )
+    accelerator.print(f"Scheduler: warmup={warmup_steps*n_proc}, total={args.max_steps*n_proc} (n_proc={n_proc})")
 
     model, optimizer, train_loader, scheduler = accelerator.prepare(
         model, optimizer, train_loader, scheduler
@@ -760,13 +724,10 @@ def main():
             if global_step >= args.max_steps:
                 break
 
-            prompts = [
-                build_prompt(tokenizer, ex,
-                             include_bridge_count=args.include_bridge_count)
-                for ex in batch_examples
-            ]
+            prompts = [build_prompt(tokenizer, ex,
+                                    include_bridge_count=args.include_bridge_count)
+                       for ex in batch_examples]
 
-            # ---- 1) Rollout: 一次性生成 G 条 completion ----
             sequences, attention_mask, completion_mask, texts = generate_completions(
                 model, tokenizer, prompts, args, accelerator
             )
@@ -779,7 +740,7 @@ def main():
             for ex in batch_examples:
                 repeated_examples.extend([ex] * G)
 
-            # ---- 2) Reward + advantage ----
+            # ---- Reward + advantage ----
             rewards, comps_list = [], []
             for text, ex in zip(texts, repeated_examples):
                 r, comps = compute_reward(
@@ -798,18 +759,22 @@ def main():
             ).view(local_bsz, G)
 
             group_mean = rewards_t.mean(dim=1, keepdim=True)
+            group_std_full = rewards_t.std(dim=1, keepdim=True, unbiased=False)
             if args.disable_std_norm:
                 advantages = (rewards_t - group_mean)
             else:
-                group_std = rewards_t.std(dim=1, keepdim=True, unbiased=False)
-                advantages = (rewards_t - group_mean) / (group_std + 1e-4)
+                advantages = (rewards_t - group_mean) / (group_std_full + 1e-4)
             advantages = advantages.view(-1).detach()
 
-            # ---- 3) Old logprobs (rollout policy) ----
+            # ---- 诊断: 多少 prompt 的 group 完全饱和(零方差) ----
+            zero_adv_frac = float((group_std_full.squeeze(1) < 1e-6).float().mean().item())
+            group_std_mean = float(group_std_full.mean().item())
+
+            # ---- Old logprobs ----
             with torch.no_grad():
                 old_logps = token_logprobs(model, sequences, attention_mask).detach()
 
-            # ---- 4) PPO 更新 (1~K epochs) ----
+            # ---- PPO 更新 ----
             for ppo_epoch in range(args.num_ppo_epochs):
                 with accelerator.accumulate(model):
                     loss, loss_stats = compute_grpo_loss(
@@ -822,12 +787,10 @@ def main():
                         old_logps=old_logps,
                         args=args,
                     )
-
                     if torch.isnan(loss) or torch.isinf(loss):
                         accelerator.print(f"[warn] loss NaN/Inf at step {global_step}, skip")
                         optimizer.zero_grad(set_to_none=True)
                         continue
-
                     accelerator.backward(loss)
                     if accelerator.sync_gradients:
                         accelerator.clip_grad_norm_(model.parameters(), args.max_grad_norm)
@@ -835,11 +798,8 @@ def main():
                         scheduler.step()
                         optimizer.zero_grad(set_to_none=True)
 
-            # ---- 5) Logging ----
+            # ---- Logging ----
             local_reward_mean = float(sum(rewards) / max(len(rewards), 1))
-            local_reward_max = float(max(rewards))
-            local_reward_min = float(min(rewards))
-
             def cm(k):
                 return float(sum(c[k] for c in comps_list) / max(len(comps_list), 1))
 
@@ -849,18 +809,19 @@ def main():
                 "kl_loss": loss_stats["kl_loss"],
                 "clipfrac": loss_stats["clipfrac"],
                 "reward_mean": local_reward_mean,
-                "reward_max": local_reward_max,
-                "reward_min": local_reward_min,
+                "reward_max": float(max(rewards)),
+                "reward_min": float(min(rewards)),
                 "format": cm("format"),
                 "bridge": cm("bridge"),
                 "answer_f1": cm("answer_f1"),
                 "answer_em": cm("answer_em"),
-                "final_effective": cm("final_effective"),
+                "chain_em": cm("chain_em"),
                 "n_pred_bridge": cm("n_pred_bridge"),
                 "has_answer_line": cm("has_answer_line"),
+                "group_std": group_std_mean,
+                "zero_adv_frac": zero_adv_frac,
                 "lr": scheduler.get_last_lr()[0],
             }
-
             smoothed_reward.append(local_reward_mean)
 
             if accelerator.sync_gradients:
@@ -874,13 +835,14 @@ def main():
                     if accelerator.is_main_process:
                         msg = (
                             f"step={global_step:04d} "
-                            f"loss={agg['loss']:.4f} "
-                            f"pg={agg['pg_loss']:.4f} "
+                            f"loss={agg['loss']:+.4f} "
+                            f"pg={agg['pg_loss']:+.4f} "
                             f"kl={agg['kl_loss']:.4f} "
-                            f"clip={agg['clipfrac']:.3f} "
                             f"R={agg['reward_mean']:.3f} "
+                            f"std={agg['group_std']:.3f} "
+                            f"zero%={agg['zero_adv_frac']*100:.0f} "
+                            f"chain={agg['chain_em']:.3f} "
                             f"B={agg['bridge']:.3f} "
-                            f"A_F1={agg['answer_f1']:.3f} "
                             f"A_EM={agg['answer_em']:.3f} "
                             f"fmt={agg['format']:.3f} "
                             f"nB={agg['n_pred_bridge']:.2f} "
@@ -890,12 +852,9 @@ def main():
                         with open(log_path, "a", encoding="utf-8") as f:
                             f.write(json.dumps(agg, ensure_ascii=False) + "\n")
 
-                # ---- 6) Eval-during-training ----
-                if (
-                    eval_examples
-                    and args.eval_steps > 0
-                    and global_step % args.eval_steps == 0
-                ):
+                # ---- Eval ----
+                if (eval_examples and args.eval_steps > 0
+                        and global_step % args.eval_steps == 0):
                     eval_metrics = quick_eval(
                         model, tokenizer, eval_examples, args, accelerator,
                         max_eval_examples=args.eval_subset_size,
@@ -907,16 +866,14 @@ def main():
                             f"EM={eval_metrics['eval_em']:.2f} "
                             f"F1={eval_metrics['eval_f1']:.2f} "
                             f"Bridge={eval_metrics['eval_bridge']:.2f} "
+                            f"ChainEM={eval_metrics['eval_chain_em']:.2f} "
                             f"(n={eval_metrics['eval_n']})"
                         )
                         with open(eval_log_path, "a", encoding="utf-8") as f:
                             f.write(json.dumps(eval_metrics, ensure_ascii=False) + "\n")
-
                         if args.save_best and eval_metrics["eval_em"] > best_eval_em:
                             best_eval_em = eval_metrics["eval_em"]
-                            accelerator.print(
-                                f"  → New best EM={best_eval_em:.2f}, saving best/"
-                            )
+                            accelerator.print(f"  → New best EM={best_eval_em:.2f}, saving best/")
                             save_checkpoint(accelerator, model, tokenizer,
                                             args.output_dir, "best")
 

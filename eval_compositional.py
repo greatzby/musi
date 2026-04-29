@@ -1,21 +1,7 @@
 """
-eval_compositional.py
+eval_compositional.py  (v2: 支持 --include_bridge_count)
 
 在 2-hop / 3-hop linear / 4-hop linear 上评估 bridge-aware 模型。
-支持单 checkpoint 或多 checkpoint 评估。
-
-Usage:
-  # 1) 自动发现所有 checkpoint-* 子目录（推荐）
-  python eval_compositional.py --auto_discover checkpoints/qwen2.5-3b-2hop-sft
-
-  # 2) 手动指定多个 checkpoint
-  python eval_compositional.py --model_dirs \
-      checkpoints/qwen2.5-3b-2hop-sft/checkpoint-225 \
-      checkpoints/qwen2.5-3b-2hop-sft/checkpoint-450 \
-      checkpoints/qwen2.5-3b-2hop-sft/checkpoint-675
-
-  # 3) 单 checkpoint（旧用法）
-  python eval_compositional.py --model_dir checkpoints/qwen2.5-3b-2hop-sft
 """
 
 import json
@@ -49,7 +35,7 @@ SYSTEM_PROMPT = (
 
 
 # ============ SQuAD-style normalization ============
-def normalize_answer(s: str) -> str:
+def normalize_answer(s):
     if s is None:
         return ""
     def remove_articles(text):
@@ -61,12 +47,12 @@ def normalize_answer(s: str) -> str:
     return white_space_fix(remove_articles(remove_punc(s.lower())))
 
 
-def em_score(pred: str, golds: List[str]) -> float:
+def em_score(pred, golds):
     p = normalize_answer(pred)
     return float(any(p == normalize_answer(g) for g in golds if g))
 
 
-def _f1_pair(pred: str, gold: str) -> float:
+def _f1_pair(pred, gold):
     p_toks = normalize_answer(pred).split()
     g_toks = normalize_answer(gold).split()
     if not p_toks or not g_toks:
@@ -80,7 +66,7 @@ def _f1_pair(pred: str, gold: str) -> float:
     return 2 * precision * recall / (precision + recall)
 
 
-def f1_score(pred: str, golds: List[str]) -> float:
+def f1_score(pred, golds):
     return max(_f1_pair(pred, g) for g in golds if g) if golds else 0.0
 
 
@@ -89,16 +75,14 @@ RE_BRIDGE = re.compile(r'^\s*Bridge\s*\d+\s*[:：]\s*(.+?)\s*$', re.IGNORECASE)
 RE_ANSWER = re.compile(r'^\s*Answer\s*[:：]\s*(.+?)\s*$', re.IGNORECASE)
 
 
-def parse_output(text: str) -> Tuple[List[str], str]:
-    bridges = []
-    answer = ""
-    answer_found = False
-    last_nonempty = ""
+def parse_output(text):
+    bridges, answer, last = [], "", ""
+    found = False
     for raw in text.strip().split('\n'):
         line = raw.strip()
         if not line:
             continue
-        last_nonempty = line
+        last = line
         m_b = RE_BRIDGE.match(line)
         if m_b:
             bridges.append(m_b.group(1).strip())
@@ -106,64 +90,59 @@ def parse_output(text: str) -> Tuple[List[str], str]:
         m_a = RE_ANSWER.match(line)
         if m_a:
             answer = m_a.group(1).strip()
-            answer_found = True
+            found = True
             continue
-    if not answer_found and last_nonempty:
-        answer = last_nonempty
+    if not found and last:
+        answer = last
     return bridges, answer
 
 
-# ============ Bridge metrics ============
-def bridge_match(pred_bridge: str, gold_bridge: str) -> bool:
-    p = normalize_answer(pred_bridge)
-    g = normalize_answer(gold_bridge)
+def bridge_match(p, g):
+    p, g = normalize_answer(p), normalize_answer(g)
     if not p or not g:
         return False
-    if p == g:
+    if p == g or g in p or p in g:
         return True
-    if g in p or p in g:
-        return True
-    if _f1_pair(pred_bridge, gold_bridge) >= 0.7:
-        return True
-    return False
+    return _f1_pair(p, g) >= 0.7
 
 
-def compute_bridge_metrics(pred_bridges: List[str], gold_bridges: List[str]) -> Dict[str, float]:
+def compute_bridge_metrics(pred_bridges, gold_bridges):
     if not gold_bridges:
         return {"bridge_recall": 1.0, "bridge_f1": 1.0, "bridge_hits": 0,
                 "n_gold": 0, "n_pred": len(pred_bridges)}
     if not pred_bridges:
         return {"bridge_recall": 0.0, "bridge_f1": 0.0, "bridge_hits": 0,
                 "n_gold": len(gold_bridges), "n_pred": 0}
-
-    hits = 0
-    for g in gold_bridges:
-        if any(bridge_match(p, g) for p in pred_bridges):
-            hits += 1
+    hits = sum(any(bridge_match(p, g) for p in pred_bridges) for g in gold_bridges)
     recall = hits / len(gold_bridges)
-
-    f1s = []
-    for g in gold_bridges:
-        best = max(_f1_pair(p, g) for p in pred_bridges)
-        f1s.append(best)
+    f1s = [max(_f1_pair(p, g) for p in pred_bridges) for g in gold_bridges]
     bridge_f1 = sum(f1s) / len(f1s)
-
     return {"bridge_recall": recall, "bridge_f1": bridge_f1, "bridge_hits": hits,
             "n_gold": len(gold_bridges), "n_pred": len(pred_bridges)}
 
 
 # ============ Input formatting ============
-def format_user_content(example: Dict) -> str:
+def format_user_content(example, include_bridge_count=False):
     parts = []
     for p in example["context_paragraphs"]:
         title = p.get("title", "")
         text  = p.get("text", p.get("paragraph_text", ""))
         parts.append(f"Passage Title: {title}\nPassage: {text}")
     ctx = "\n\n".join(parts)
-    return f"{ctx}\n\nQuestion: {example['question']}"
+    question = example["question"]
+    if include_bridge_count:
+        n_bridge = len(example.get("bridges", []))
+        count_hint = (
+            f"\n\nThis question requires exactly {n_bridge} intermediate "
+            f"bridge answer(s). Output exactly {n_bridge} bridge line(s), "
+            f"then the final answer line."
+        )
+    else:
+        count_hint = ""
+    return f"{ctx}\n\nQuestion: {question}{count_hint}"
 
 
-def get_final_golds(example: Dict) -> List[str]:
+def get_final_golds(example):
     golds = []
     if example.get("final_answer"):
         golds.append(example["final_answer"])
@@ -174,19 +153,12 @@ def get_final_golds(example: Dict) -> List[str]:
     return [g for g in golds if g] or [""]
 
 
-# ============ Generation ============
 @torch.no_grad()
-def generate_batch(model, tokenizer, prompts: List[str],
-                   max_new_tokens: int, max_input_len: int) -> List[str]:
+def generate_batch(model, tokenizer, prompts, max_new_tokens, max_input_len):
     inputs = tokenizer(
-        prompts,
-        return_tensors="pt",
-        padding=True,
-        truncation=True,
-        max_length=max_input_len,
-        add_special_tokens=False,
+        prompts, return_tensors="pt", padding=True, truncation=True,
+        max_length=max_input_len, add_special_tokens=False,
     ).to(model.device)
-
     eos_id = tokenizer.convert_tokens_to_ids("<|im_end|>")
     out = model.generate(
         **inputs,
@@ -197,18 +169,12 @@ def generate_batch(model, tokenizer, prompts: List[str],
         use_cache=True,
     )
     prompt_len = inputs["input_ids"].shape[1]
-    answers = []
-    for seq in out:
-        new_tokens = seq[prompt_len:]
-        ans = tokenizer.decode(new_tokens, skip_special_tokens=True).strip()
-        answers.append(ans)
-    return answers
+    return [tokenizer.decode(seq[prompt_len:], skip_special_tokens=True).strip()
+            for seq in out]
 
 
-# ============ Per-file evaluation ============
-def evaluate_file(model, tokenizer, jsonl_path: str,
-                  batch_size: int, max_new_tokens: int,
-                  max_input_len: int, limit: int = None):
+def evaluate_file(model, tokenizer, jsonl_path, batch_size, max_new_tokens,
+                  max_input_len, include_bridge_count, limit=None):
     examples = []
     with open(jsonl_path, "r", encoding="utf-8") as f:
         for line in f:
@@ -222,102 +188,82 @@ def evaluate_file(model, tokenizer, jsonl_path: str,
     for ex in examples:
         msgs = [
             {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user",   "content": format_user_content(ex)},
+            {"role": "user",   "content": format_user_content(ex, include_bridge_count)},
         ]
-        p = tokenizer.apply_chat_template(msgs, tokenize=False,
-                                          add_generation_prompt=True)
-        prompts.append(p)
+        prompts.append(tokenizer.apply_chat_template(
+            msgs, tokenize=False, add_generation_prompt=True))
 
     order = sorted(range(len(prompts)), key=lambda i: len(prompts[i]))
     sorted_prompts = [prompts[i] for i in order]
-
     sorted_outputs = []
     for i in tqdm(range(0, len(sorted_prompts), batch_size),
                   desc=os.path.basename(jsonl_path)):
-        batch = sorted_prompts[i:i+batch_size]
+        batch = sorted_prompts[i:i + batch_size]
         sorted_outputs.extend(generate_batch(
-            model, tokenizer, batch,
-            max_new_tokens=max_new_tokens,
-            max_input_len=max_input_len,
-        ))
+            model, tokenizer, batch, max_new_tokens, max_input_len))
 
     raw_outputs = [None] * len(prompts)
     for rank, orig_idx in enumerate(order):
         raw_outputs[orig_idx] = sorted_outputs[rank]
 
-    em_total = 0.0
-    f1_total = 0.0
-    bridge_recall_total = 0.0
-    bridge_f1_total = 0.0
-    chain_em_total = 0.0
+    em_t = f1_t = br_t = bf_t = chain_t = 0.0
     detailed = []
-
     for ex, raw in zip(examples, raw_outputs):
         pred_bridges, pred_answer = parse_output(raw)
         gold_bridges = ex.get("bridges", [])
         final_golds  = get_final_golds(ex)
-
         em = em_score(pred_answer, final_golds)
         f1 = f1_score(pred_answer, final_golds)
         bm = compute_bridge_metrics(pred_bridges, gold_bridges)
         chain_em = float(em == 1.0 and bm["bridge_hits"] == bm["n_gold"])
-
-        em_total += em
-        f1_total += f1
-        bridge_recall_total += bm["bridge_recall"]
-        bridge_f1_total     += bm["bridge_f1"]
-        chain_em_total      += chain_em
-
+        em_t += em; f1_t += f1; br_t += bm["bridge_recall"]
+        bf_t += bm["bridge_f1"]; chain_t += chain_em
         detailed.append({
-            "id":            ex.get("id", ""),
-            "hop":           ex.get("hop"),
-            "question":      ex.get("question", ""),
-            "gold_bridges":  gold_bridges,
-            "gold_final":    final_golds,
-            "pred_raw":      raw,
-            "pred_bridges":  pred_bridges,
-            "pred_answer":   pred_answer,
-            "em":            em,
-            "f1":            f1,
+            "id": ex.get("id", ""),
+            "hop": ex.get("hop"),
+            "question": ex.get("question", ""),
+            "gold_bridges": gold_bridges,
+            "gold_final": final_golds,
+            "pred_raw": raw,
+            "pred_bridges": pred_bridges,
+            "pred_answer": pred_answer,
+            "em": em, "f1": f1,
             "bridge_recall": bm["bridge_recall"],
-            "bridge_f1":     bm["bridge_f1"],
-            "bridge_hits":   bm["bridge_hits"],
-            "chain_em":      chain_em,
+            "bridge_f1": bm["bridge_f1"],
+            "bridge_hits": bm["bridge_hits"],
+            "chain_em": chain_em,
         })
-
     n = len(examples)
     return {
-        "n":             n,
-        "em":            em_total / n * 100,
-        "f1":            f1_total / n * 100,
-        "bridge_recall": bridge_recall_total / n * 100,
-        "bridge_f1":     bridge_f1_total / n * 100,
-        "chain_em":      chain_em_total / n * 100,
+        "n": n,
+        "em":            em_t / n * 100,
+        "f1":            f1_t / n * 100,
+        "bridge_recall": br_t / n * 100,
+        "bridge_f1":     bf_t / n * 100,
+        "chain_em":      chain_t / n * 100,
     }, detailed
 
 
-# ============ Multi-checkpoint helpers ============
 def discover_checkpoints(parent_dir):
     pattern = re.compile(r'^(checkpoint-\d+|final|best)$')
     found = []
     for name in os.listdir(parent_dir):
         if pattern.match(name) and os.path.isdir(os.path.join(parent_dir, name)):
-            # 用 step 排序，final 放最后
-            step = int(re.search(r'\d+', name).group()) if 'checkpoint' in name else 1e9
+            m = re.search(r'\d+', name)
+            step = int(m.group()) if m else 10**9
             found.append((step, os.path.join(parent_dir, name)))
     found.sort()
     return [p for _, p in found]
 
 
-def load_model_and_tokenizer(model_dir: str):
+def load_model_and_tokenizer(model_dir):
     tokenizer = AutoTokenizer.from_pretrained(model_dir, trust_remote_code=True)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     tokenizer.padding_side = "left"
-
     model = AutoModelForCausalLM.from_pretrained(
         model_dir,
-        dtype=torch.bfloat16,
+        torch_dtype=torch.bfloat16,
         attn_implementation="sdpa",
         trust_remote_code=True,
     ).cuda()
@@ -326,35 +272,30 @@ def load_model_and_tokenizer(model_dir: str):
 
 
 def free_gpu(model, tokenizer):
-    del model
-    del tokenizer
+    del model, tokenizer
     gc.collect()
     torch.cuda.empty_cache()
 
 
 def main():
     parser = argparse.ArgumentParser()
-    # 三种互斥的输入方式
-    parser.add_argument("--model_dir", type=str, default=None,
-                        help="单 checkpoint 模式")
-    parser.add_argument("--model_dirs", type=str, nargs="+", default=None,
-                        help="手动指定多个 checkpoint")
-    parser.add_argument("--auto_discover", type=str, default=None,
-                        help="父目录，自动发现所有 checkpoint-* 子目录")
-    parser.add_argument("--include_root", action="store_true",
-                        help="auto_discover 时也评估父目录本身（最终模型）")
+    parser.add_argument("--model_dir", type=str, default=None)
+    parser.add_argument("--model_dirs", type=str, nargs="+", default=None)
+    parser.add_argument("--auto_discover", type=str, default=None)
+    parser.add_argument("--include_root", action="store_true")
+    parser.add_argument("--include_bridge_count", action="store_true",
+                        help="prompt 中告诉模型需要多少个 bridge (oracle)")
 
-    parser.add_argument("--eval_dir",       type=str, default=EVAL_DIR)
-    parser.add_argument("--out_dir",        type=str, default="eval_results_2hop")
-    parser.add_argument("--batch_size",     type=int, default=8)
+    parser.add_argument("--eval_dir", type=str, default=EVAL_DIR)
+    parser.add_argument("--out_dir", type=str, default="eval_results_2hop")
+    parser.add_argument("--batch_size", type=int, default=8)
     parser.add_argument("--max_new_tokens", type=int, default=128)
-    parser.add_argument("--max_input_len",  type=int, default=4096)
-    parser.add_argument("--limit",          type=int, default=None)
+    parser.add_argument("--max_input_len", type=int, default=4096)
+    parser.add_argument("--limit", type=int, default=None)
     parser.add_argument("--splits", nargs="+",
                         default=["2hop", "3hop_linear", "4hop_linear"])
     args = parser.parse_args()
 
-    # 决定要评估的模型列表
     if args.auto_discover:
         model_dirs = discover_checkpoints(args.auto_discover)
         if args.include_root:
@@ -368,34 +309,27 @@ def main():
     else:
         model_dirs = [DEFAULT_MODEL_DIR]
 
-    print(f"Will evaluate {len(model_dirs)} model(s):")
+    print(f"Will evaluate {len(model_dirs)} model(s) "
+          f"(include_bridge_count={args.include_bridge_count}):")
     for d in model_dirs:
         print(f"  - {d}")
 
     os.makedirs(args.out_dir, exist_ok=True)
-
-    all_results = {}  # {ckpt_name: {split: metrics}}
+    all_results = {}
 
     for model_dir in model_dirs:
-        # 给每个 checkpoint 取个短名字
         ckpt_name = os.path.basename(os.path.normpath(model_dir))
-        if not ckpt_name.startswith("checkpoint"):
-            ckpt_name = "final"
-
+        if not re.match(r'^(checkpoint-\d+|final|best)$', ckpt_name):
+            ckpt_name = "root"
         ckpt_out_dir = os.path.join(args.out_dir, ckpt_name)
         os.makedirs(ckpt_out_dir, exist_ok=True)
 
-        print(f"\n{'#'*70}")
-        print(f"# Evaluating: {model_dir}")
-        print(f"# Output: {ckpt_out_dir}")
-        print(f"{'#'*70}")
-
+        print(f"\n{'#'*70}\n# Evaluating: {model_dir}\n# Output: {ckpt_out_dir}\n{'#'*70}")
         model, tokenizer = load_model_and_tokenizer(model_dir)
-
         ckpt_summary = {}
+
         for split in args.splits:
             if split not in EVAL_FILES:
-                print(f"[skip] unknown split: {split}")
                 continue
             path = os.path.join(args.eval_dir, EVAL_FILES[split])
             if not os.path.exists(path):
@@ -407,15 +341,13 @@ def main():
                 batch_size=args.batch_size,
                 max_new_tokens=args.max_new_tokens,
                 max_input_len=args.max_input_len,
+                include_bridge_count=args.include_bridge_count,
                 limit=args.limit,
             )
-            print(f"  n={metrics['n']:>5}  "
-                  f"EM={metrics['em']:>5.2f}  F1={metrics['f1']:>5.2f}  "
+            print(f"  n={metrics['n']:>5}  EM={metrics['em']:>5.2f}  F1={metrics['f1']:>5.2f}  "
                   f"BridgeR={metrics['bridge_recall']:>5.2f}  "
-                  f"BridgeF1={metrics['bridge_f1']:>5.2f}  "
-                  f"ChainEM={metrics['chain_em']:>5.2f}")
+                  f"BridgeF1={metrics['bridge_f1']:>5.2f}  ChainEM={metrics['chain_em']:>5.2f}")
             ckpt_summary[split] = metrics
-
             with open(os.path.join(ckpt_out_dir, f"{split}_predictions.jsonl"),
                       "w", encoding="utf-8") as f:
                 for d in detailed:
@@ -424,36 +356,26 @@ def main():
         with open(os.path.join(ckpt_out_dir, "summary.json"),
                   "w", encoding="utf-8") as f:
             json.dump(ckpt_summary, f, indent=2, ensure_ascii=False)
-
         all_results[ckpt_name] = ckpt_summary
-
-        # 释放显存，准备评估下一个 checkpoint
         free_gpu(model, tokenizer)
 
-    # ===== 跨 checkpoint 汇总 =====
     print("\n" + "=" * 100)
-    print("CROSS-CHECKPOINT COMPARISON")
+    print(f"CROSS-CHECKPOINT COMPARISON  (include_bridge_count={args.include_bridge_count})")
     print("=" * 100)
-
-    metric_keys   = ["em", "f1", "bridge_recall", "bridge_f1", "chain_em"]
+    metric_keys = ["em", "f1", "bridge_recall", "bridge_f1", "chain_em"]
     metric_labels = {"em": "EM", "f1": "F1", "bridge_recall": "BridgeR",
                      "bridge_f1": "BridgeF1", "chain_em": "ChainEM"}
-
     for split in args.splits:
         print(f"\n--- {split} ---")
-        header = f"{'Checkpoint':<22}" + f"{'N':>6}" + \
-                 "".join(f"{metric_labels[m]:>10}" for m in metric_keys)
+        header = f"{'Checkpoint':<22}{'N':>6}" + "".join(f"{metric_labels[m]:>10}" for m in metric_keys)
         print(header)
         print("-" * len(header))
         for ckpt_name, ckpt_summary in all_results.items():
             if split not in ckpt_summary:
                 continue
             m = ckpt_summary[split]
-            row = f"{ckpt_name:<22}{m['n']:>6}" + \
-                  "".join(f"{m[k]:>10.2f}" for k in metric_keys)
-            print(row)
+            print(f"{ckpt_name:<22}{m['n']:>6}" + "".join(f"{m[k]:>10.2f}" for k in metric_keys))
     print("=" * 100)
-
     with open(os.path.join(args.out_dir, "all_checkpoints_summary.json"),
               "w", encoding="utf-8") as f:
         json.dump(all_results, f, indent=2, ensure_ascii=False)
