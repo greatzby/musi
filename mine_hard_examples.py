@@ -1,28 +1,21 @@
 """
-mine_hard_examples.py
+mine_hard_examples.py  (v2: sampling-based + easy-sample mixing)
 
-跑一遍 SFT checkpoint 在训练集上的 reward,
-扔掉 reward >= threshold 的"easy"样本,
-保留 hard examples 用于 GRPO.
-
-用法:
-  python mine_hard_examples.py \
-      --model_dir checkpoints/qwen2.5-3b-2hop-sft/checkpoint-225 \
-      --input_file prepared_data_2hop/train_2hop.jsonl \
-      --output_file hard_data_from_225/train_2hop_hard.jsonl \
-      --reward_threshold 0.95 \
-      --reward_mode chain_binary \
-      --include_bridge_count
+关键改进:
+- 每个 example 用 sampling 采 N 次 (与 RL 的 num_generations 一致)
+- 用 mean_reward 分类 hard / easy (而不是 greedy 单次)
+- 混入 easy 样本: 保证 min_easy_ratio + 凑够 target_size
 """
 
 import argparse
 import json
 import os
+import random
 import re
 import string
 from collections import Counter
 from dataclasses import dataclass
-from typing import Dict, List, Tuple
+from typing import Dict, List
 
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -44,7 +37,7 @@ SYSTEM_PROMPT = (
 )
 
 
-def format_user_content(example: Dict, include_bridge_count: bool = False) -> str:
+def format_user_content(example, include_bridge_count=False):
     parts = []
     for p in example["context_paragraphs"]:
         title = p.get("title", "")
@@ -65,7 +58,7 @@ def format_user_content(example: Dict, include_bridge_count: bool = False) -> st
 
 
 # ============================================================
-# QA metrics (与 rl_grpo_2hop.py 一致)
+# QA metrics
 # ============================================================
 
 def normalize_answer(s):
@@ -179,7 +172,7 @@ def parse_output(text):
 
 
 # ============================================================
-# Reward (与 rl_grpo_2hop.py 一致, 包含 chain_binary)
+# Reward (与 rl_grpo_2hop.py 严格一致)
 # ============================================================
 
 def compute_bridge_score(pred_bridges, gold_bridges):
@@ -213,9 +206,7 @@ def compute_format_score(parsed, n_gold_bridges):
     return min(score, 1.0)
 
 
-def compute_reward(text, example, reward_mode,
-                   w_format=0.10, w_bridge=0.45, w_final=0.45,
-                   bridge_gate_floor=0.0):
+def compute_reward(text, example, reward_mode):
     parsed = parse_output(text)
     gold_bridges = example.get("bridges", [])
     final_golds = get_final_golds(example)
@@ -226,8 +217,7 @@ def compute_reward(text, example, reward_mode,
     format_score = compute_format_score(parsed, len(gold_bridges))
 
     if reward_mode == "chain_binary":
-        bridge_threshold = 0.5
-        bridge_pass = float(bridge_score >= bridge_threshold)
+        bridge_pass = float(bridge_score >= 0.5)
         chain_correct = float(answer_em == 1.0 and bridge_pass == 1.0)
         if chain_correct == 1.0:
             reward = 1.0
@@ -239,19 +229,12 @@ def compute_reward(text, example, reward_mode,
             )
             reward = min(partial, 0.85)
     elif reward_mode == "process_final":
-        final_effective = answer_f1 * (
-            bridge_gate_floor + (1.0 - bridge_gate_floor) * bridge_score
-        )
-        denom = max(w_format + w_bridge + w_final, 1e-8)
-        reward = (
-            w_format * format_score
-            + w_bridge * bridge_score
-            + w_final * final_effective
-        ) / denom
+        final_effective = answer_f1 * bridge_score
+        reward = 0.10 * format_score + 0.45 * bridge_score + 0.45 * final_effective
     elif reward_mode == "final_only":
         reward = 0.15 * format_score + 0.85 * answer_f1
     else:
-        raise ValueError(f"Unsupported reward_mode for mining: {reward_mode}")
+        raise ValueError(f"Unsupported reward_mode: {reward_mode}")
 
     reward = float(max(0.0, min(1.0, reward)))
     return reward, {
@@ -272,19 +255,41 @@ def main():
     parser.add_argument("--model_dir", required=True)
     parser.add_argument("--input_file", required=True)
     parser.add_argument("--output_file", required=True)
-    parser.add_argument("--reward_threshold", type=float, default=0.95,
-                        help="reward < threshold 的样本会保留")
+
+    # Reward
     parser.add_argument("--reward_mode", default="chain_binary",
                         choices=["chain_binary", "process_final", "final_only"])
     parser.add_argument("--include_bridge_count", action="store_true")
-    parser.add_argument("--batch_size", type=int, default=16)
+
+    # Sampling (mining 时用 sampling)
+    parser.add_argument("--num_samples", type=int, default=4,
+                        help="每个样本采几次")
+    parser.add_argument("--temperature", type=float, default=0.9)
+    parser.add_argument("--top_p", type=float, default=0.95)
+
+    # Hard / Easy 分类
+    parser.add_argument("--reward_threshold", type=float, default=0.85,
+                        help="mean_reward < threshold → hard")
+
+    # Easy 混合策略
+    parser.add_argument("--target_size", type=int, default=5000,
+                        help="希望最终数据集大小. 0 = 不强制")
+    parser.add_argument("--min_easy_ratio", type=float, default=0.2,
+                        help="最终 easy 样本占比下限 (0~1)")
+
+    # Misc
+    parser.add_argument("--batch_size", type=int, default=8,
+                        help="prompt 数 (每个 prompt 会被采样 num_samples 次)")
     parser.add_argument("--max_new_tokens", type=int, default=128)
     parser.add_argument("--max_input_len", type=int, default=4096)
     parser.add_argument("--limit", type=int, default=None)
-    parser.add_argument("--keep_prob_for_easy", type=float, default=0.0,
-                        help="给 easy 样本保留概率, 比如 0.1 = 10% easy 样本也保留")
+    parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
 
+    random.seed(args.seed)
+    torch.manual_seed(args.seed)
+
+    # ---- Load model ----
     print(f"Loading model from {args.model_dir} ...")
     tokenizer = AutoTokenizer.from_pretrained(args.model_dir, trust_remote_code=True)
     if tokenizer.pad_token is None:
@@ -299,6 +304,7 @@ def main():
     ).cuda()
     model.eval()
 
+    # ---- Load data ----
     examples = []
     with open(args.input_file, "r", encoding="utf-8") as f:
         for line in f:
@@ -309,6 +315,7 @@ def main():
         examples = examples[: args.limit]
     print(f"Loaded {len(examples)} examples from {args.input_file}")
 
+    # ---- Build prompts ----
     prompts = []
     for ex in examples:
         msgs = [
@@ -325,11 +332,17 @@ def main():
     sorted_examples = [examples[i] for i in order]
 
     eos_id = tokenizer.convert_tokens_to_ids("<|im_end|>")
-    sorted_rewards, sorted_outputs, sorted_metas = [], [], []
 
-    for i in tqdm(range(0, len(sorted_prompts), args.batch_size), desc="Mining"):
+    # storage 按 sorted 顺序
+    sorted_rewards_per_ex = [[] for _ in range(len(prompts))]
+    sorted_outputs_per_ex = [[] for _ in range(len(prompts))]
+    sorted_metas_per_ex = [[] for _ in range(len(prompts))]
+
+    desc = f"Mining (N={args.num_samples}, T={args.temperature})"
+    for i in tqdm(range(0, len(sorted_prompts), args.batch_size), desc=desc):
         batch_prompts = sorted_prompts[i : i + args.batch_size]
         batch_examples = sorted_examples[i : i + args.batch_size]
+        n_in_batch = len(batch_prompts)
 
         inputs = tokenizer(
             batch_prompts,
@@ -344,89 +357,156 @@ def main():
             out = model.generate(
                 **inputs,
                 max_new_tokens=args.max_new_tokens,
-                do_sample=False,
+                do_sample=True,
+                temperature=args.temperature,
+                top_p=args.top_p,
+                num_return_sequences=args.num_samples,
                 pad_token_id=tokenizer.pad_token_id,
                 eos_token_id=eos_id,
                 use_cache=True,
             )
 
         prompt_len = inputs["input_ids"].shape[1]
-        new = tokenizer.batch_decode(out[:, prompt_len:], skip_special_tokens=True)
+        new_tokens = out[:, prompt_len:]
+        # generate 输出顺序是: ex0_s0, ex0_s1, ..., ex0_s(N-1), ex1_s0, ...
+        texts = tokenizer.batch_decode(new_tokens, skip_special_tokens=True)
 
-        for ex, txt in zip(batch_examples, new):
-            txt = txt.strip()
-            r, meta = compute_reward(txt, ex, reward_mode=args.reward_mode)
-            sorted_rewards.append(r)
-            sorted_outputs.append(txt)
-            sorted_metas.append(meta)
+        for j in range(n_in_batch):
+            ex = batch_examples[j]
+            for k in range(args.num_samples):
+                idx = j * args.num_samples + k
+                txt = texts[idx].strip()
+                r, meta = compute_reward(txt, ex, reward_mode=args.reward_mode)
+                sorted_rewards_per_ex[i + j].append(r)
+                sorted_outputs_per_ex[i + j].append(txt)
+                sorted_metas_per_ex[i + j].append(meta)
 
-    # 还原顺序
-    rewards = [None] * len(examples)
-    outputs = [None] * len(examples)
-    metas = [None] * len(examples)
-    for rank, orig_idx in enumerate(order):
-        rewards[orig_idx] = sorted_rewards[rank]
-        outputs[orig_idx] = sorted_outputs[rank]
-        metas[orig_idx] = sorted_metas[rank]
+    # 还原原顺序
+    rewards_per_ex = [None] * len(examples)
+    outputs_per_ex = [None] * len(examples)
+    metas_per_ex = [None] * len(examples)
+    for sorted_i, orig_i in enumerate(order):
+        rewards_per_ex[orig_i] = sorted_rewards_per_ex[sorted_i]
+        outputs_per_ex[orig_i] = sorted_outputs_per_ex[sorted_i]
+        metas_per_ex[orig_i] = sorted_metas_per_ex[sorted_i]
 
-    # 划分 hard / easy
-    import random
-    random.seed(42)
-    hard_examples, easy_examples = [], []
-    for ex, r, out_text, meta in zip(examples, rewards, outputs, metas):
-        record = dict(ex)
-        record["_mine_reward"] = r
-        record["_mine_output"] = out_text
-        record["_mine_meta"] = meta
-        if r < args.reward_threshold:
-            hard_examples.append(record)
-        elif random.random() < args.keep_prob_for_easy:
-            hard_examples.append(record)  # 少量 easy 也保留, 防止灾难性遗忘
-        else:
-            easy_examples.append(record)
+    # 聚合
+    mean_rewards = [sum(rs) / len(rs) for rs in rewards_per_ex]
+    success_rates = [
+        sum(1 for r in rs if r >= 0.95) / len(rs) for rs in rewards_per_ex
+    ]
+    group_stds = [
+        (sum((r - sum(rs)/len(rs))**2 for r in rs) / len(rs)) ** 0.5
+        for rs in rewards_per_ex
+    ]
 
-    # 统计
-    print(f"\n{'='*60}")
-    print(f"Mining Result (reward_mode={args.reward_mode})")
-    print(f"{'='*60}")
-    print(f"Total examples       : {len(examples)}")
-    print(f"Hard (r < {args.reward_threshold:.2f})    : "
-          f"{len(hard_examples)}  ({len(hard_examples)/len(examples)*100:.1f}%)")
-    print(f"Easy (r >= {args.reward_threshold:.2f})   : "
-          f"{len(easy_examples)}  ({len(easy_examples)/len(examples)*100:.1f}%)")
-    print(f"Mean reward          : {sum(rewards)/len(rewards):.4f}")
+    # 分类
+    hard_indices = [i for i, mr in enumerate(mean_rewards) if mr < args.reward_threshold]
+    easy_indices = [i for i, mr in enumerate(mean_rewards) if mr >= args.reward_threshold]
+
+    # 计算要补多少 easy
+    n_hard = len(hard_indices)
+    if args.target_size > 0:
+        n_for_target = max(0, args.target_size - n_hard)
+    else:
+        n_for_target = 0
+    if 0 < args.min_easy_ratio < 1:
+        # 最终 easy/(hard+easy) ≥ min_easy_ratio
+        # easy ≥ min_easy_ratio * (hard + easy)
+        # easy*(1 - r) ≥ r*hard  →  easy ≥ r*hard / (1-r)
+        n_for_ratio = int(round(n_hard * args.min_easy_ratio / (1 - args.min_easy_ratio)))
+    else:
+        n_for_ratio = 0
+    n_easy_to_add = max(n_for_target, n_for_ratio)
+    n_easy_to_add = min(n_easy_to_add, len(easy_indices))
+
+    sampled_easy = random.sample(easy_indices, n_easy_to_add) if n_easy_to_add > 0 else []
+    final_indices = hard_indices + sampled_easy
+    random.shuffle(final_indices)
+
+    # ============ Print stats ============
+    print(f"\n{'='*70}")
+    print(f"Mining Result")
+    print(f"{'='*70}")
+    print(f"Model           : {args.model_dir}")
+    print(f"Num samples / ex: {args.num_samples} (T={args.temperature}, top_p={args.top_p})")
+    print(f"Reward mode     : {args.reward_mode}")
+    print(f"Hard threshold  : mean_reward < {args.reward_threshold}")
+    print()
+    print(f"Total examples           : {len(examples)}")
+    print(f"  Hard (mean_r < {args.reward_threshold:.2f})   : "
+          f"{n_hard}  ({n_hard/len(examples)*100:.1f}%)")
+    print(f"  Easy (mean_r >= {args.reward_threshold:.2f}) : "
+          f"{len(easy_indices)}  ({len(easy_indices)/len(examples)*100:.1f}%)")
+    print(f"Mean of mean_rewards     : {sum(mean_rewards)/len(mean_rewards):.4f}")
+    print(f"Mean success_rate        : {sum(success_rates)/len(success_rates):.4f}")
+    print(f"Mean group_std (signal)  : {sum(group_stds)/len(group_stds):.4f}")
 
     # 直方图
-    bins = [0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 0.95, 1.0001]
+    bins = [0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.85, 0.9, 0.95, 1.0001]
     hist = [0] * (len(bins) - 1)
-    for r in rewards:
+    for mr in mean_rewards:
         for k in range(len(bins) - 1):
-            if bins[k] <= r < bins[k + 1]:
+            if bins[k] <= mr < bins[k + 1]:
                 hist[k] += 1
                 break
     max_h = max(hist) if max(hist) > 0 else 1
-    print("\nReward distribution:")
+    print("\nMean reward distribution:")
     for k in range(len(bins) - 1):
         bar = "#" * int(hist[k] / max_h * 50)
         print(f"  [{bins[k]:.2f}, {bins[k+1]:.2f}): {hist[k]:6d}  {bar}")
 
-    # 写文件
-    os.makedirs(os.path.dirname(args.output_file) or ".", exist_ok=True)
-    with open(args.output_file, "w", encoding="utf-8") as f:
-        for ex in hard_examples:
-            ex_clean = {k: v for k, v in ex.items() if not k.startswith("_mine_")}
-            f.write(json.dumps(ex_clean, ensure_ascii=False) + "\n")
-    print(f"\n✓ Hard examples → {args.output_file}")
+    print(f"\nMixing:")
+    print(f"  Hard kept                 : {n_hard}")
+    print(f"  Easy needed (target_size) : {n_for_target}")
+    print(f"  Easy needed (min_ratio)   : {n_for_ratio}")
+    print(f"  Easy actually added       : {n_easy_to_add}")
+    print(f"  → Final dataset size      : {len(final_indices)}")
+    if len(final_indices) > 0:
+        print(f"  → Final hard ratio        : "
+              f"{n_hard/len(final_indices)*100:.1f}%")
+        print(f"  → Final easy ratio        : "
+              f"{n_easy_to_add/len(final_indices)*100:.1f}%")
 
+    # ============ Write files ============
+    os.makedirs(os.path.dirname(args.output_file) or ".", exist_ok=True)
+
+    # 主输出文件: 带上 mining metadata (RL 会忽略未知字段)
+    with open(args.output_file, "w", encoding="utf-8") as f:
+        for i in final_indices:
+            rec = dict(examples[i])
+            rec["_mine_mean_reward"] = float(mean_rewards[i])
+            rec["_mine_success_rate"] = float(success_rates[i])
+            rec["_mine_group_std"] = float(group_stds[i])
+            rec["_mine_is_hard"] = bool(mean_rewards[i] < args.reward_threshold)
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    print(f"\n✓ Final dataset → {args.output_file}  ({len(final_indices)} examples)")
+
+    # debug: hard 样本
     debug_dir = os.path.dirname(args.output_file) or "."
-    debug_file = os.path.join(
-        debug_dir,
-        os.path.basename(args.output_file).replace(".jsonl", "_easy_sample.jsonl")
-    )
-    with open(debug_file, "w", encoding="utf-8") as f:
-        for ex in easy_examples[:200]:
-            f.write(json.dumps(ex, ensure_ascii=False) + "\n")
-    print(f"✓ Easy sample (first 200, with reward info) → {debug_file}")
+    base = os.path.basename(args.output_file).replace(".jsonl", "")
+
+    debug_hard = os.path.join(debug_dir, f"{base}_debug_hard.jsonl")
+    with open(debug_hard, "w", encoding="utf-8") as f:
+        for i in random.sample(hard_indices, min(100, len(hard_indices))):
+            rec = dict(examples[i])
+            rec["_mine_mean_reward"] = float(mean_rewards[i])
+            rec["_mine_success_rate"] = float(success_rates[i])
+            rec["_mine_group_std"] = float(group_stds[i])
+            rec["_mine_outputs"] = outputs_per_ex[i]
+            rec["_mine_rewards_per_sample"] = [float(r) for r in rewards_per_ex[i]]
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    print(f"✓ Hard debug (100 with full outputs) → {debug_hard}")
+
+    debug_easy = os.path.join(debug_dir, f"{base}_debug_easy.jsonl")
+    with open(debug_easy, "w", encoding="utf-8") as f:
+        for i in random.sample(easy_indices, min(100, len(easy_indices))):
+            rec = dict(examples[i])
+            rec["_mine_mean_reward"] = float(mean_rewards[i])
+            rec["_mine_success_rate"] = float(success_rates[i])
+            rec["_mine_outputs"] = outputs_per_ex[i][:2]
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    print(f"✓ Easy debug (100 with first 2 outputs) → {debug_easy}")
 
 
 if __name__ == "__main__":
