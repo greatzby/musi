@@ -1,28 +1,97 @@
-# eval_rl.py
-"""Evaluate an RL LoRA adapter (or any HF model) on the same 4 splits as eval.py.
-Output format mirrors eval.py: per-split predictions.jsonl + summary.json."""
+# eval_rl.py — aligned with eval.py's prompt format, supports LoRA adapters.
+import argparse, json, os, re, string
+from collections import Counter
+from typing import List, Dict
 
-import argparse, json, os
 import torch
 from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from rl_common import f1_score, em_score, build_messages
 
-SPLITS = {
-    "1hop":        "prepared_data/eval_1hop.jsonl",
-    "2hop_linear": "prepared_data/eval_2hop_linear.jsonl",
-    "3hop_linear": "prepared_data/eval_3hop_linear.jsonl",
-    "4hop_linear": "prepared_data/eval_4hop_linear.jsonl",
+EVAL_DIR = "prepared_data"
+EVAL_FILES = {
+    "1hop":        "eval_1hop.jsonl",
+    "2hop_linear": "eval_2hop_linear.jsonl",
+    "3hop_linear": "eval_3hop_linear.jsonl",
+    "4hop_linear": "eval_4hop_linear.jsonl",
 }
-
-MULTIHOP_SYSTEM = (
-    "You answer questions based strictly on the given passages. "
+SYSTEM_PROMPT = (
+    "You answer questions based strictly on the given passage. "
     "Output only a short, direct answer (a few words), with no explanation."
 )
 
 
-def load_model(ckpt, base_default):
+# ============ SQuAD-style normalization ============
+def normalize_answer(s: str) -> str:
+    def remove_articles(text):
+        return re.sub(r'\b(a|an|the)\b', ' ', text)
+    def white_space_fix(text):
+        return ' '.join(text.split())
+    def remove_punc(text):
+        return ''.join(ch for ch in text if ch not in set(string.punctuation))
+    return white_space_fix(remove_articles(remove_punc(s.lower())))
+
+
+def em_score(pred: str, golds: List[str]) -> float:
+    p = normalize_answer(pred)
+    return float(any(p == normalize_answer(g) for g in golds))
+
+
+def f1_score(pred: str, golds: List[str]) -> float:
+    def _f1(p, g):
+        p_toks = normalize_answer(p).split()
+        g_toks = normalize_answer(g).split()
+        if not p_toks or not g_toks:
+            return float(p_toks == g_toks)
+        common = Counter(p_toks) & Counter(g_toks)
+        num_same = sum(common.values())
+        if num_same == 0:
+            return 0.0
+        precision = num_same / len(p_toks)
+        recall    = num_same / len(g_toks)
+        return 2 * precision * recall / (precision + recall)
+    return max(_f1(pred, g) for g in golds)
+
+
+# ============ Input formatting (mirrors eval.py exactly) ============
+def format_user_content(example: Dict) -> str:
+    # 1) 1-hop / atomic: single passage
+    if 'context' in example and 'context_title' in example:
+        return (
+            f"Passage Title: {example['context_title']}\n"
+            f"Passage: {example['context']}\n\n"
+            f"Question: {example['question']}"
+        )
+    # 2) Multi-hop: context_paragraphs (all supporting, no distractors)
+    if 'context_paragraphs' in example:
+        parts = []
+        for p in example['context_paragraphs']:
+            title = p.get('title', '')
+            text  = p.get('text', p.get('paragraph_text', ''))
+            parts.append(f"Passage Title: {title}\nPassage: {text}")
+        ctx = '\n\n'.join(parts)
+        return f"{ctx}\n\nQuestion: {example['question']}"
+    raise ValueError(f"Unknown schema: keys={list(example.keys())}")
+
+
+def get_golds(example: Dict) -> List[str]:
+    """1-hop -> answer; multi-hop -> final_answer (+ aliases)."""
+    golds = []
+    if example.get('answer'):
+        golds.append(example['answer'])
+    if example.get('final_answer'):
+        golds.append(example['final_answer'])
+    if example.get('answer_aliases'):
+        golds.extend(example['answer_aliases'])
+    return golds if golds else ['']
+
+
+def get_id(example: Dict) -> str:
+    return example.get('id') or example.get('source_id') or ''
+
+
+# ============ Model loading (full ckpt OR LoRA adapter) ============
+def load_model(ckpt: str, base_default: str):
     is_lora = os.path.exists(os.path.join(ckpt, "adapter_config.json"))
     if is_lora:
         from peft import PeftModel
@@ -34,8 +103,8 @@ def load_model(ckpt, base_default):
             attn_implementation="sdpa", trust_remote_code=True,
         ).cuda()
         model = PeftModel.from_pretrained(base, ckpt).cuda()
-        # tokenizer: prefer adapter dir, fall back to base
-        tok_path = ckpt if os.path.exists(os.path.join(ckpt, "tokenizer_config.json")) else base_path
+        # tokenizer: prefer base (must match what SFT was trained with)
+        tok_path = base_path
     else:
         print("  Full model checkpoint")
         model = AutoModelForCausalLM.from_pretrained(
@@ -45,69 +114,116 @@ def load_model(ckpt, base_default):
         tok_path = ckpt
 
     tok = AutoTokenizer.from_pretrained(tok_path, trust_remote_code=True)
-    if tok.pad_token is None: tok.pad_token = tok.eos_token
-    tok.padding_side = "left"
+    if tok.pad_token is None:
+        tok.pad_token = tok.eos_token
+    tok.padding_side = "left"  # required for batched generate
     model.eval()
     return model, tok
 
 
-def build_prompt(ex, hop, tokenizer):
-    if hop == 1:
-        msgs = build_messages(ex)  # uses context_title / context / question
-    else:
-        passages = ex.get("passages")
-        if passages:
-            blocks = [f"Passage {i+1} ({p.get('title','')}):\n{p.get('text','')}"
-                      for i, p in enumerate(passages)]
-            user = "\n\n".join(blocks) + f"\n\nQuestion: {ex['question']}"
-        else:
-            user = (f"Passage Title: {ex.get('context_title','')}\n"
-                    f"Passage: {ex.get('context','')}\n\n"
-                    f"Question: {ex['question']}")
+# ============ Generation ============
+@torch.no_grad()
+def generate_batch(model, tokenizer, prompts: List[str],
+                   max_new_tokens: int, max_input_len: int) -> List[str]:
+    inputs = tokenizer(
+        prompts,
+        return_tensors="pt",
+        padding=True,
+        truncation=True,
+        max_length=max_input_len,
+        add_special_tokens=False,  # chat template already adds them
+    ).to(model.device)
+
+    # Qwen2.5: stop on <|im_end|>, NOT default eos_token (<|endoftext|>)
+    im_end = tokenizer.convert_tokens_to_ids("<|im_end|>")
+    eos_id = im_end if im_end is not None and im_end >= 0 else tokenizer.eos_token_id
+
+    out = model.generate(
+        **inputs,
+        max_new_tokens=max_new_tokens,
+        do_sample=False,
+        eos_token_id=eos_id,
+        pad_token_id=tokenizer.pad_token_id,
+        use_cache=True,
+    )
+    prompt_len = inputs['input_ids'].shape[1]
+    answers = []
+    for seq in out:
+        new_tokens = seq[prompt_len:]
+        ans = tokenizer.decode(new_tokens, skip_special_tokens=True).strip()
+        answers.append(ans)
+    return answers
+
+
+def evaluate_file(model, tokenizer, jsonl_path: str,
+                  batch_size: int, max_new_tokens: int,
+                  max_input_len: int, hop: int, limit: int = None,
+                  debug_n: int = 3):
+    examples = []
+    with open(jsonl_path, 'r', encoding='utf-8') as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                examples.append(json.loads(line))
+    if limit:
+        examples = examples[:limit]
+
+    print(f"  [debug] keys: {list(examples[0].keys())}")
+
+    prompts = []
+    for ex in examples:
+        user = format_user_content(ex)
         msgs = [
-            {"role": "system", "content": MULTIHOP_SYSTEM},
+            {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user",   "content": user},
         ]
-    return tokenizer.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
+        p = tokenizer.apply_chat_template(msgs, tokenize=False,
+                                          add_generation_prompt=True)
+        prompts.append(p)
 
+    # length-sorted batching
+    order = sorted(range(len(prompts)), key=lambda i: len(prompts[i]))
+    sorted_prompts = [prompts[i] for i in order]
 
-def best_em(p, gs): return max((em_score(p,g) for g in gs), default=0.0)
-def best_f1(p, gs): return max((f1_score(p,g) for g in gs), default=0.0)
+    sorted_preds = []
+    for i in tqdm(range(0, len(sorted_prompts), batch_size),
+                  desc=os.path.basename(jsonl_path)):
+        batch = sorted_prompts[i:i+batch_size]
+        sorted_preds.extend(generate_batch(
+            model, tokenizer, batch,
+            max_new_tokens=max_new_tokens,
+            max_input_len=max_input_len,
+        ))
 
+    preds = [None] * len(prompts)
+    for rank, orig_idx in enumerate(order):
+        preds[orig_idx] = sorted_preds[rank]
 
-@torch.no_grad()
-def eval_split(model, tok, path, hop, batch_size, max_new_tokens, limit=None):
-    with open(path) as f:
-        examples = [json.loads(l) for l in f if l.strip()]
-    if limit: examples = examples[:limit]
+    em_total = f1_total = 0.0
+    detailed = []
+    for k, (ex, pred) in enumerate(zip(examples, preds)):
+        golds = get_golds(ex)
+        em = em_score(pred, golds)
+        f1 = f1_score(pred, golds)
+        em_total += em
+        f1_total += f1
+        detailed.append({
+            'id':         get_id(ex),
+            'hop':        ex.get('hop', hop),
+            'question':   ex.get('question', ''),
+            'gold':       golds,
+            'gold_chain': ex.get('gold_chain', []),
+            'pred':       pred,
+            'em':         em,
+            'f1':         f1,
+        })
+        if k < debug_n:
+            print(f"  [debug] Q: {ex.get('question','')[:120]}")
+            print(f"  [debug] gold: {golds}")
+            print(f"  [debug] pred: {pred!r}")
 
-    preds = []
-    for i in tqdm(range(0, len(examples), batch_size), desc=os.path.basename(path)):
-        chunk = examples[i:i+batch_size]
-        prompts = [build_prompt(e, hop, tok) for e in chunk]
-        enc = tok(prompts, return_tensors="pt", padding=True,
-                  truncation=True, max_length=2048,
-                  add_special_tokens=False).to(model.device)
-        out = model.generate(
-            **enc, max_new_tokens=max_new_tokens, do_sample=False,
-            pad_token_id=tok.pad_token_id, eos_token_id=tok.eos_token_id,
-        )
-        plen = enc["input_ids"].size(1)
-        for j, ex in enumerate(chunk):
-            gen = out[j, plen:]
-            np_ = (gen != tok.pad_token_id).nonzero()
-            gen = gen[:np_.max().item()+1] if len(np_) else gen[:0]
-            text = tok.decode(gen, skip_special_tokens=True).strip()
-            golds = ex.get("gold") or [ex["answer"]]
-            preds.append({
-                "id": ex.get("id",""), "hop": hop,
-                "question": ex["question"], "gold": golds,
-                "gold_chain": ex.get("gold_chain", []),
-                "pred": text,
-                "em": best_em(text, golds), "f1": best_f1(text, golds),
-            })
-    n = len(preds) or 1
-    return preds, sum(p["em"] for p in preds)/n*100, sum(p["f1"] for p in preds)/n*100
+    n = len(examples)
+    return {'n': n, 'em': em_total / n * 100, 'f1': f1_total / n * 100}, detailed
 
 
 def main():
@@ -115,9 +231,13 @@ def main():
     ap.add_argument("--ckpt", required=True)
     ap.add_argument("--base", default="checkpoints/qwen2.5-3b-atomic-sft")
     ap.add_argument("--out_dir", required=True)
+    ap.add_argument("--eval_dir", default=EVAL_DIR)
     ap.add_argument("--batch_size", type=int, default=16)
-    ap.add_argument("--max_new_tokens", type=int, default=64)
+    ap.add_argument("--max_new_tokens", type=int, default=32)
+    ap.add_argument("--max_input_len", type=int, default=4096)
     ap.add_argument("--limit", type=int, default=None)
+    ap.add_argument("--splits", nargs='+',
+                    default=['1hop', '2hop_linear', '3hop_linear', '4hop_linear'])
     args = ap.parse_args()
 
     os.makedirs(args.out_dir, exist_ok=True)
@@ -125,28 +245,41 @@ def main():
     model, tok = load_model(args.ckpt, args.base)
 
     summary = {}
-    for split_name, path in SPLITS.items():
+    for split_name in args.splits:
+        if split_name not in EVAL_FILES:
+            print(f"[skip] unknown split: {split_name}")
+            continue
+        path = os.path.join(args.eval_dir, EVAL_FILES[split_name])
+        if not os.path.exists(path):
+            print(f"[skip] not found: {path}")
+            continue
         hop = int(split_name[0])
         print(f"\n=== {split_name} ===")
-        preds, em, f1 = eval_split(
-            model, tok, path, hop,
-            args.batch_size, args.max_new_tokens, args.limit
+        metrics, detailed = evaluate_file(
+            model, tok, path,
+            batch_size=args.batch_size,
+            max_new_tokens=args.max_new_tokens,
+            max_input_len=args.max_input_len,
+            hop=hop,
+            limit=args.limit,
         )
-        with open(os.path.join(args.out_dir, f"{split_name}_predictions.jsonl"), "w") as f:
-            for p in preds:
-                f.write(json.dumps(p, ensure_ascii=False) + "\n")
-        summary[split_name] = {"n": len(preds), "EM": em, "F1": f1}
-        print(f"  n={len(preds)}  EM={em:.2f}  F1={f1:.2f}")
+        print(f"  n={metrics['n']}  EM={metrics['em']:.2f}  F1={metrics['f1']:.2f}")
+        summary[split_name] = metrics
 
-    with open(os.path.join(args.out_dir, "summary.json"), "w") as f:
-        json.dump(summary, f, indent=2)
+        with open(os.path.join(args.out_dir, f"{split_name}_predictions.jsonl"),
+                  'w', encoding='utf-8') as f:
+            for d in detailed:
+                f.write(json.dumps(d, ensure_ascii=False) + '\n')
 
     print("\n" + "="*60)
-    print(f"{'Split':<14}{'N':>8}{'EM':>10}{'F1':>10}")
+    print(f"{'Split':<15} {'N':>6} {'EM':>8} {'F1':>8}")
     print("-"*60)
-    for s, r in summary.items():
-        print(f"{s:<14}{r['n']:>8}{r['EM']:>10.2f}{r['F1']:>10.2f}")
+    for split, m in summary.items():
+        print(f"{split:<15} {m['n']:>6} {m['em']:>8.2f} {m['f1']:>8.2f}")
     print("="*60)
+
+    with open(os.path.join(args.out_dir, 'summary.json'), 'w', encoding='utf-8') as f:
+        json.dump(summary, f, indent=2, ensure_ascii=False)
     print(f"\nResults saved to {args.out_dir}/")
 
 
