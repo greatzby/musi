@@ -1,3 +1,7 @@
+#!/bin/bash
+set -e
+
+CKPTS=(225 450 675)
 # ========== 评估所有 RL checkpoints ==========
 for CKPT in "${CKPTS[@]}"; do
     echo "############################################"
