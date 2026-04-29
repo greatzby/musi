@@ -297,20 +297,16 @@ def evaluate_file(model, tokenizer, jsonl_path: str,
 
 
 # ============ Multi-checkpoint helpers ============
-def discover_checkpoints(parent_dir: str) -> List[str]:
-    """Find all checkpoint-N subdirs in parent_dir, sorted by step ascending."""
-    pattern = re.compile(r'^checkpoint-(\d+)$')
+def discover_checkpoints(parent_dir):
+    pattern = re.compile(r'^(checkpoint-\d+|final|best)$')
     found = []
-    if not os.path.isdir(parent_dir):
-        return []
     for name in os.listdir(parent_dir):
-        m = pattern.match(name)
-        if m:
-            full = os.path.join(parent_dir, name)
-            if os.path.isdir(full):
-                found.append((int(m.group(1)), full))
+        if pattern.match(name) and os.path.isdir(os.path.join(parent_dir, name)):
+            # 用 step 排序，final 放最后
+            step = int(re.search(r'\d+', name).group()) if 'checkpoint' in name else 1e9
+            found.append((step, os.path.join(parent_dir, name)))
     found.sort()
-    return [path for _, path in found]
+    return [p for _, p in found]
 
 
 def load_model_and_tokenizer(model_dir: str):
