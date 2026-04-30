@@ -1,10 +1,10 @@
 """
-sft_train_2hop.py  (v2: CLI args for max_steps / output_dir / save_strategy)
+sft_train_2hop.py  (v2: step-based saving for fine-grained SFT trajectory)
 
-默认行为和原版完全一致；新增 CLI 覆盖以便训练早期 ckpt-50。
+在 MuSiQue 2-hop 上做 bridge-aware SFT。
+此版本：每 50 步存一个 checkpoint，到 200 步停止，用于研究 SFT 早期学习动态。
 """
 
-import argparse
 import json
 import os
 from dataclasses import dataclass
@@ -19,10 +19,10 @@ from transformers import (
     Trainer,
 )
 
-# ================== 默认配置 ==================
+# ================== 配置 ==================
 MODEL_NAME    = "Qwen/Qwen2.5-3B"
 TRAIN_FILE    = "prepared_data_2hop/train_2hop.jsonl"
-OUTPUT_DIR    = "checkpoints/qwen2.5-3b-2hop-sft"
+OUTPUT_DIR    = "checkpoints/qwen2.5-3b-2hop-sft-fine"   # ★ 新目录,不覆盖已有
 MAX_LEN       = 2048
 
 SYSTEM_PROMPT = (
@@ -36,24 +36,7 @@ SYSTEM_PROMPT = (
 # =========================================
 
 
-def parse_cli():
-    p = argparse.ArgumentParser()
-    p.add_argument("--model_name",       default=MODEL_NAME)
-    p.add_argument("--train_file",       default=TRAIN_FILE)
-    p.add_argument("--output_dir",       default=OUTPUT_DIR)
-    p.add_argument("--num_train_epochs", type=float, default=3.0)
-    p.add_argument("--max_steps",        type=int,   default=-1,
-                   help=">0 时覆盖 num_train_epochs")
-    p.add_argument("--save_strategy",    default="epoch",
-                   choices=["epoch", "steps", "no"])
-    p.add_argument("--save_steps",       type=int,   default=500)
-    p.add_argument("--save_total_limit", type=int,   default=3)
-    p.add_argument("--learning_rate",    type=float, default=2e-5)
-    p.add_argument("--seed",             type=int,   default=42)
-    return p.parse_args()
-
-
-def load_jsonl(path):
+def load_jsonl(path: str) -> List[Dict]:
     data = []
     with open(path, "r", encoding="utf-8") as f:
         for line in f:
@@ -63,7 +46,7 @@ def load_jsonl(path):
     return data
 
 
-def format_user_content(example):
+def format_user_content(example: Dict) -> str:
     parts = []
     for p in example["context_paragraphs"]:
         parts.append(f"Passage Title: {p['title']}\nPassage: {p['text']}")
@@ -71,7 +54,7 @@ def format_user_content(example):
     return f"{ctx}\n\nQuestion: {example['question']}"
 
 
-def format_assistant_target(example):
+def format_assistant_target(example: Dict) -> str:
     lines = []
     for i, b in enumerate(example["bridges"], start=1):
         lines.append(f"Bridge {i}: {b}")
@@ -79,7 +62,7 @@ def format_assistant_target(example):
     return "\n".join(lines)
 
 
-def build_messages(example):
+def build_messages(example: Dict) -> List[Dict]:
     return [
         {"role": "system",    "content": SYSTEM_PROMPT},
         {"role": "user",      "content": format_user_content(example)},
@@ -87,23 +70,20 @@ def build_messages(example):
     ]
 
 
-def encode(example, tokenizer, max_length=MAX_LEN):
+def encode(example: Dict, tokenizer, max_length: int = MAX_LEN) -> Dict:
     messages = build_messages(example)
     full_text = tokenizer.apply_chat_template(messages, tokenize=False)
     prompt_text = tokenizer.apply_chat_template(
         messages[:-1], tokenize=False, add_generation_prompt=True
     )
-
     full_ids   = tokenizer(full_text,   add_special_tokens=False, truncation=True,
                            max_length=max_length)["input_ids"]
     prompt_ids = tokenizer(prompt_text, add_special_tokens=False)["input_ids"]
     prompt_len = min(len(prompt_ids), len(full_ids))
-
     labels = [-100] * prompt_len + full_ids[prompt_len:]
     labels = labels[:len(full_ids)]
     while len(labels) < len(full_ids):
         labels.append(-100)
-
     return {
         "input_ids":      full_ids,
         "attention_mask": [1] * len(full_ids),
@@ -114,7 +94,8 @@ def encode(example, tokenizer, max_length=MAX_LEN):
 @dataclass
 class PadCollator:
     pad_token_id: int
-    def __call__(self, batch):
+
+    def __call__(self, batch: List[Dict]) -> Dict[str, torch.Tensor]:
         max_len = max(len(b["input_ids"]) for b in batch)
         out = {"input_ids": [], "attention_mask": [], "labels": []}
         for b in batch:
@@ -126,14 +107,12 @@ class PadCollator:
 
 
 def main():
-    cli = parse_cli()
-
-    tokenizer = AutoTokenizer.from_pretrained(cli.model_name, trust_remote_code=True)
+    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, trust_remote_code=True)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
     model = AutoModelForCausalLM.from_pretrained(
-        cli.model_name,
+        MODEL_NAME,
         dtype=torch.bfloat16,
         attn_implementation="sdpa",
         trust_remote_code=True,
@@ -141,7 +120,7 @@ def main():
     model.gradient_checkpointing_enable()
     model.config.use_cache = False
 
-    raw = load_jsonl(cli.train_file)
+    raw = load_jsonl(TRAIN_FILE)
     print(f"Loaded {len(raw)} 2-hop training examples")
 
     ds = Dataset.from_list(raw)
@@ -157,26 +136,26 @@ def main():
     lens = [len(ex["input_ids"]) for ex in ds.select(range(min(100, len(ds))))]
     print(f"Sample input length: min={min(lens)}, max={max(lens)}, mean={sum(lens)/len(lens):.0f}")
 
+    # ★★★ 关键修改:step-based saving ★★★
     args = TrainingArguments(
-        output_dir              = cli.output_dir,
-        num_train_epochs        = cli.num_train_epochs,
-        max_steps               = cli.max_steps if cli.max_steps > 0 else -1,
+        output_dir              = OUTPUT_DIR,
+        max_steps               = 200,           # ★ 跑 200 步就停
         per_device_train_batch_size = 4,
         gradient_accumulation_steps = 8,
-        learning_rate           = cli.learning_rate,
+        learning_rate           = 2e-5,
         lr_scheduler_type       = "cosine",
         warmup_ratio            = 0.03,
         weight_decay            = 0.0,
         max_grad_norm           = 1.0,
         bf16                    = True,
-        logging_steps           = 20,
-        save_strategy           = cli.save_strategy,
-        save_steps              = cli.save_steps,
-        save_total_limit        = cli.save_total_limit,
+        logging_steps           = 10,            # ★ 更密的 log
+        save_strategy           = "steps",       # ★ 改成按步数存
+        save_steps              = 50,            # ★ 每 50 步存一次
+        save_total_limit        = 5,             # ★ 留 50/100/150/200 + 缓冲
         report_to               = "none",
         ddp_find_unused_parameters = False,
         dataloader_num_workers  = 4,
-        seed                    = cli.seed,
+        seed                    = 42,
     )
 
     trainer = Trainer(
@@ -188,9 +167,10 @@ def main():
     )
 
     trainer.train()
-    trainer.save_model(cli.output_dir)
-    tokenizer.save_pretrained(cli.output_dir)
-    print(f"Done. Saved to {cli.output_dir}")
+    trainer.save_model(OUTPUT_DIR)
+    tokenizer.save_pretrained(OUTPUT_DIR)
+    print(f"Done. Saved to {OUTPUT_DIR}")
+    print(f"Checkpoints: {OUTPUT_DIR}/checkpoint-{{50,100,150,200}}")
 
 
 if __name__ == "__main__":
