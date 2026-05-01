@@ -21,7 +21,7 @@ SFT_INIT=checkpoints/qwen2.5-3b-2hop-sft-fine/checkpoint-100
 TRAIN_FILE=prepared_data_2hop/train_2hop.jsonl
 EVAL_FILE=prepared_data_2hop/eval_2hop.jsonl
 
-ANTI_W=0.5         # λ in reward = base - λ*answer_em
+ANTI_W=1.0         # λ in reward = base - λ*answer_em
 MAX_STEPS=1500
 SAVE_STEPS=200
 LR=1e-6
