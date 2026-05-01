@@ -1,7 +1,12 @@
 """
-rl_grpo_2hop.py  (v2: chain_binary reward + scheduler fix + diagnostics)
+rl_grpo_2hop.py  (v3: + bridge_minus_answer reward for engineered drift)
 
 GRPO fine-tuning for MuSiQue 2-hop bridge-aware training.
+
+New in v3:
+  --reward_mode bridge_minus_answer
+    reward = 0.15*format + 0.85*bridge - λ*answer_em       (λ=anti_answer_weight)
+    Pushes the policy to keep bridge but DROP final answer  -> engineered drift.
 """
 
 import argparse
@@ -254,7 +259,8 @@ def compute_format_score(parsed, n_gold_bridges):
 
 
 def compute_reward(text, example, reward_mode,
-                   w_format, w_bridge, w_final, bridge_gate_floor):
+                   w_format, w_bridge, w_final, bridge_gate_floor,
+                   anti_answer_weight=0.5):
     parsed = parse_output(text)
     gold_bridges = example.get("bridges", [])
     final_golds = get_final_golds(example)
@@ -264,7 +270,7 @@ def compute_reward(text, example, reward_mode,
     answer_em = em_score(parsed.answer, final_golds)
     format_score = compute_format_score(parsed, len(gold_bridges))
 
-    # ---- chain_binary: 完全做对才给 1.0, 否则 cap 0.85 ----
+    # ---- chain_binary ----
     if reward_mode == "chain_binary":
         bridge_threshold = 0.5
         bridge_pass = float(bridge_score >= bridge_threshold)
@@ -278,6 +284,8 @@ def compute_reward(text, example, reward_mode,
                 + 0.30 * answer_f1 * bridge_score
             )
             reward = min(partial, 0.85)
+
+    # ---- process_final ----
     elif reward_mode == "process_final":
         final_effective = answer_f1 * (
             bridge_gate_floor + (1.0 - bridge_gate_floor) * bridge_score
@@ -288,18 +296,39 @@ def compute_reward(text, example, reward_mode,
             + w_bridge * bridge_score
             + w_final * final_effective
         ) / denom
+
+    # ---- final_only ----
     elif reward_mode == "final_only":
         reward = 0.15 * format_score + 0.85 * answer_f1
+
+    # ---- process_only ----
     elif reward_mode == "process_only":
         reward = 0.15 * format_score + 0.85 * bridge_score
+
+    # ---- format_only ----
     elif reward_mode == "format_only":
         reward = format_score
+
+    # ---- NEW: bridge_minus_answer (engineered drift) ----
+    elif reward_mode == "bridge_minus_answer":
+        # base ∈ [0,1]: 鼓励 bridge + format
+        base = 0.15 * format_score + 0.85 * bridge_score
+        # penalty ∈ [0, λ]: 惩罚 final answer 正确
+        penalty = anti_answer_weight * answer_em
+        reward = base - penalty
+        # 不在这里 clamp 到 [0,1], 见下面 mode-aware clamp
+
     else:
         raise ValueError(f"Unknown reward_mode: {reward_mode}")
 
-    reward = float(max(0.0, min(1.0, reward)))
+    # ---- mode-aware clamp ----
+    if reward_mode == "bridge_minus_answer":
+        # 允许负 reward: 范围 [-λ, 1]
+        reward = float(max(-1.0, min(1.0, reward)))
+    else:
+        reward = float(max(0.0, min(1.0, reward)))
 
-    # 计算严格 chain_em (供日志)
+    # 严格 chain_em 供日志
     bridge_pass_strict = float(bridge_score >= 0.5)
     chain_em_strict = float(answer_em == 1.0 and bridge_pass_strict == 1.0)
 
@@ -589,11 +618,15 @@ def parse_args():
     # Reward
     p.add_argument("--reward_mode", type=str, default="chain_binary",
                    choices=["chain_binary", "process_final", "final_only",
-                            "process_only", "format_only"])
+                            "process_only", "format_only",
+                            "bridge_minus_answer"])
     p.add_argument("--w_format", type=float, default=0.10)
     p.add_argument("--w_bridge", type=float, default=0.45)
     p.add_argument("--w_final", type=float, default=0.45)
     p.add_argument("--bridge_gate_floor", type=float, default=0.0)
+    # NEW
+    p.add_argument("--anti_answer_weight", type=float, default=0.5,
+                   help="lambda in: reward = base - lambda*answer_em (only used by bridge_minus_answer)")
 
     # Eval-during-training
     p.add_argument("--eval_file", type=str, default="prepared_data_2hop/eval_2hop.jsonl")
@@ -688,8 +721,6 @@ def main():
         weight_decay=args.weight_decay,
     )
 
-    # ★ FIX: 多卡下 accelerate 会把 scheduler.step() 调用 num_processes 次,
-    #   把 num_training_steps 乘上 num_processes 让 cosine 周期对齐
     n_proc = accelerator.num_processes
     warmup_steps = int(args.max_steps * args.warmup_ratio)
     scheduler = get_cosine_schedule_with_warmup(
@@ -750,6 +781,7 @@ def main():
                     w_bridge=args.w_bridge,
                     w_final=args.w_final,
                     bridge_gate_floor=args.bridge_gate_floor,
+                    anti_answer_weight=args.anti_answer_weight,
                 )
                 rewards.append(r)
                 comps_list.append(comps)
@@ -766,15 +798,12 @@ def main():
                 advantages = (rewards_t - group_mean) / (group_std_full + 1e-4)
             advantages = advantages.view(-1).detach()
 
-            # ---- 诊断: 多少 prompt 的 group 完全饱和(零方差) ----
             zero_adv_frac = float((group_std_full.squeeze(1) < 1e-6).float().mean().item())
             group_std_mean = float(group_std_full.mean().item())
 
-            # ---- Old logprobs ----
             with torch.no_grad():
                 old_logps = token_logprobs(model, sequences, attention_mask).detach()
 
-            # ---- PPO 更新 ----
             for ppo_epoch in range(args.num_ppo_epochs):
                 with accelerator.accumulate(model):
                     loss, loss_stats = compute_grpo_loss(
@@ -798,7 +827,6 @@ def main():
                         scheduler.step()
                         optimizer.zero_grad(set_to_none=True)
 
-            # ---- Logging ----
             local_reward_mean = float(sum(rewards) / max(len(rewards), 1))
             def cm(k):
                 return float(sum(c[k] for c in comps_list) / max(len(comps_list), 1))
@@ -838,12 +866,12 @@ def main():
                             f"loss={agg['loss']:+.4f} "
                             f"pg={agg['pg_loss']:+.4f} "
                             f"kl={agg['kl_loss']:.4f} "
-                            f"R={agg['reward_mean']:.3f} "
+                            f"R={agg['reward_mean']:+.3f} "
                             f"std={agg['group_std']:.3f} "
                             f"zero%={agg['zero_adv_frac']*100:.0f} "
-                            f"chain={agg['chain_em']:.3f} "
                             f"B={agg['bridge']:.3f} "
                             f"A_EM={agg['answer_em']:.3f} "
+                            f"chain={agg['chain_em']:.3f} "
                             f"fmt={agg['format']:.3f} "
                             f"nB={agg['n_pred_bridge']:.2f} "
                             f"lr={agg['lr']:.2e}"
@@ -852,7 +880,6 @@ def main():
                         with open(log_path, "a", encoding="utf-8") as f:
                             f.write(json.dumps(agg, ensure_ascii=False) + "\n")
 
-                # ---- Eval ----
                 if (eval_examples and args.eval_steps > 0
                         and global_step % args.eval_steps == 0):
                     eval_metrics = quick_eval(
