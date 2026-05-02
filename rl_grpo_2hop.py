@@ -1,15 +1,17 @@
 """
-rl_grpo_2hop.py  (v3: + bridge_minus_answer reward for engineered drift)
+rl_grpo_2hop.py  (v3.1: + chunked token_logprobs to avoid OOM on Qwen2.5-3B 151k vocab)
 
 GRPO fine-tuning for MuSiQue 2-hop bridge-aware training.
 
-New in v3:
-  --reward_mode bridge_minus_answer
-    reward = 0.15*format + 0.85*bridge - λ*answer_em       (λ=anti_answer_weight)
-    Pushes the policy to keep bridge but DROP final answer  -> engineered drift.
+v3.1 changes (vs v3):
+  - token_logprobs() now CHUNKS the log_softmax over the time dimension,
+    so we never materialize a full [B, T, V] fp32 tensor (~10GB+ for Qwen2.5-3B).
+  - quick_eval() and main loop call gc.collect() + torch.cuda.empty_cache()
+    after eval to defragment GPU memory.
 """
 
 import argparse
+import gc
 import json
 import math
 import os
@@ -309,26 +311,20 @@ def compute_reward(text, example, reward_mode,
     elif reward_mode == "format_only":
         reward = format_score
 
-    # ---- NEW: bridge_minus_answer (engineered drift) ----
+    # ---- bridge_minus_answer (engineered drift) ----
     elif reward_mode == "bridge_minus_answer":
-        # base ∈ [0,1]: 鼓励 bridge + format
         base = 0.15 * format_score + 0.85 * bridge_score
-        # penalty ∈ [0, λ]: 惩罚 final answer 正确
         penalty = anti_answer_weight * answer_em
         reward = base - penalty
-        # 不在这里 clamp 到 [0,1], 见下面 mode-aware clamp
 
     else:
         raise ValueError(f"Unknown reward_mode: {reward_mode}")
 
-    # ---- mode-aware clamp ----
     if reward_mode == "bridge_minus_answer":
-        # 允许负 reward: 范围 [-λ, 1]
         reward = float(max(-1.0, min(1.0, reward)))
     else:
         reward = float(max(0.0, min(1.0, reward)))
 
-    # 严格 chain_em 供日志
     bridge_pass_strict = float(bridge_score >= 0.5)
     chain_em_strict = float(answer_em == 1.0 and bridge_pass_strict == 1.0)
 
@@ -437,14 +433,44 @@ def generate_completions(model, tokenizer, prompts, args, accelerator):
     return sequences, attention_mask, completion_mask, texts
 
 
-def token_logprobs(model, input_ids, attention_mask):
+# ============================================================
+# ★★★ FIXED: chunked log-softmax to avoid [B, T, V] fp32 OOM ★★★
+# ============================================================
+
+def token_logprobs(model, input_ids, attention_mask, chunk_size: int = 512):
+    """
+    Memory-efficient per-token log-prob computation.
+
+    The original implementation did:
+        log_probs = F.log_softmax(logits.float(), dim=-1)   # [B, T, V] fp32
+    For Qwen2.5-3B (V=151936), B=8, T=2176, this is ~10 GB just for the
+    fp32 logits tensor, plus another ~10 GB for log_softmax output → OOM
+    after eval (which fragments memory via KV cache).
+
+    Fix: process the time dimension in chunks. With chunk_size=512 the
+    peak is ~5 GB instead of ~21 GB.
+    """
     out = model(input_ids=input_ids, attention_mask=attention_mask, use_cache=False)
-    logits = out.logits[:, :-1, :]
-    labels = input_ids[:, 1:]
-    log_probs = F.log_softmax(logits.float(), dim=-1)
-    gathered = log_probs.gather(dim=-1, index=labels.unsqueeze(-1)).squeeze(-1)
-    zero = torch.zeros(gathered.shape[0], 1, device=gathered.device, dtype=gathered.dtype)
-    return torch.cat([zero, gathered], dim=1)
+    logits = out.logits[:, :-1, :]      # [B, T-1, V]  (bf16 in mixed-precision)
+    labels = input_ids[:, 1:]           # [B, T-1]
+    B, Tm1, V = logits.shape
+
+    chunks = []
+    for i in range(0, Tm1, chunk_size):
+        end = min(i + chunk_size, Tm1)
+        # Cast only the small slice to fp32; original tensor stays bf16
+        lc = logits[:, i:end, :].float()                          # [B, c, V] fp32
+        labc = labels[:, i:end]                                   # [B, c]
+        log_probs_c = F.log_softmax(lc, dim=-1)                   # [B, c, V] fp32
+        gathered_c = log_probs_c.gather(
+            dim=-1, index=labc.unsqueeze(-1)
+        ).squeeze(-1)                                             # [B, c]
+        chunks.append(gathered_c)
+        # Help allocator reuse memory between chunks
+        del lc, log_probs_c
+    gathered = torch.cat(chunks, dim=1)                           # [B, T-1]
+    zero = torch.zeros(B, 1, device=gathered.device, dtype=gathered.dtype)
+    return torch.cat([zero, gathered], dim=1)                     # [B, T]
 
 
 def masked_mean(x, mask, eps=1e-8):
@@ -453,7 +479,8 @@ def masked_mean(x, mask, eps=1e-8):
 
 def compute_grpo_loss(model, ref_model, sequences, attention_mask, completion_mask,
                       advantages, old_logps, args):
-    new_logps = token_logprobs(model, sequences, attention_mask)
+    new_logps = token_logprobs(model, sequences, attention_mask,
+                               chunk_size=args.logprob_chunk_size)
     log_ratio = new_logps - old_logps
     log_ratio = torch.clamp(log_ratio, -20.0, 20.0)
     ratio = torch.exp(log_ratio)
@@ -465,7 +492,8 @@ def compute_grpo_loss(model, ref_model, sequences, attention_mask, completion_ma
 
     if ref_model is not None and args.kl_beta > 0:
         with torch.no_grad():
-            ref_logps = token_logprobs(ref_model, sequences, attention_mask)
+            ref_logps = token_logprobs(ref_model, sequences, attention_mask,
+                                       chunk_size=args.logprob_chunk_size)
         log_ratio_ref = torch.clamp(ref_logps - new_logps, -20.0, 20.0)
         kl = torch.exp(log_ratio_ref) - log_ratio_ref - 1.0
         kl_loss = masked_mean(kl, completion_mask)
@@ -535,9 +563,16 @@ def quick_eval(model, tokenizer, eval_examples, args, accelerator,
             f1_sum += f1
             bridge_sum += bs_
             chain_em_sum += float(em == 1.0 and bs_ >= 0.5)
+        # Free per-batch eval tensors
+        del inputs, out
 
     n = len(eval_examples)
     unwrapped.config.use_cache = False
+
+    # ★ Defragment GPU memory after eval (this is what was missing)
+    gc.collect()
+    torch.cuda.empty_cache()
+
     return {
         "eval_em":       em_sum / n * 100,
         "eval_f1":       f1_sum / n * 100,
@@ -624,7 +659,6 @@ def parse_args():
     p.add_argument("--w_bridge", type=float, default=0.45)
     p.add_argument("--w_final", type=float, default=0.45)
     p.add_argument("--bridge_gate_floor", type=float, default=0.0)
-    # NEW
     p.add_argument("--anti_answer_weight", type=float, default=0.5,
                    help="lambda in: reward = base - lambda*answer_em (only used by bridge_minus_answer)")
 
@@ -638,6 +672,11 @@ def parse_args():
     p.add_argument("--save_steps", type=int, default=100)
     p.add_argument("--save_best", action="store_true", default=True)
     p.add_argument("--fix_mistral_regex", action="store_true")
+
+    # ★ NEW: chunk size for token_logprobs (lower = less memory, slightly slower)
+    p.add_argument("--logprob_chunk_size", type=int, default=512,
+                   help="Chunk size along time dim for log_softmax. "
+                        "Lower if still OOM (try 256 or 128).")
     return p.parse_args()
 
 
@@ -802,7 +841,8 @@ def main():
             group_std_mean = float(group_std_full.mean().item())
 
             with torch.no_grad():
-                old_logps = token_logprobs(model, sequences, attention_mask).detach()
+                old_logps = token_logprobs(model, sequences, attention_mask,
+                                           chunk_size=args.logprob_chunk_size).detach()
 
             for ppo_epoch in range(args.num_ppo_epochs):
                 with accelerator.accumulate(model):
@@ -886,6 +926,11 @@ def main():
                         model, tokenizer, eval_examples, args, accelerator,
                         max_eval_examples=args.eval_subset_size,
                     )
+                    # ★ Make sure all ranks defragment after main did eval
+                    accelerator.wait_for_everyone()
+                    gc.collect()
+                    torch.cuda.empty_cache()
+
                     if accelerator.is_main_process and eval_metrics is not None:
                         eval_metrics["step"] = global_step
                         print(
@@ -903,10 +948,15 @@ def main():
                             accelerator.print(f"  → New best EM={best_eval_em:.2f}, saving best/")
                             save_checkpoint(accelerator, model, tokenizer,
                                             args.output_dir, "best")
+                            # ★ Save also frees memory since state_dict is collected
+                            gc.collect()
+                            torch.cuda.empty_cache()
 
                 if global_step % args.save_steps == 0:
                     save_checkpoint(accelerator, model, tokenizer,
                                     args.output_dir, f"checkpoint-{global_step}")
+                    gc.collect()
+                    torch.cuda.empty_cache()
 
             if global_step >= args.max_steps:
                 break

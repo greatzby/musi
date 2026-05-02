@@ -1,13 +1,22 @@
 #!/bin/bash
 # run_step3_rl_anchored.sh
 # Phase 3: Anchored GRPO from SFT-50, chain_binary reward + KL=0.05
+# v3.1: + PYTORCH_CUDA_ALLOC_CONF, set -o pipefail, auto-backup of old run
+
 set -e
+set -o pipefail   # ← 让 tee 不吞掉错误，崩溃立即停
+
+# ★ 关键环境变量：让 PyTorch 用新分配器，对 GRPO 这种频繁 alloc/free 极有效
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+export NCCL_TIMEOUT=1800
+export NCCL_ASYNC_ERROR_HANDLING=1
+export TOKENIZERS_PARALLELISM=false
 
 # ============ 配置 ============
 N_GPUS=2
 
 SFT_CKPT="checkpoints/qwen2.5-3b-2hop-sft-light/checkpoint-50"
-TRAIN_FILE="prepared_data_2hop/train_2hop_mined.jsonl"   # ← 用 mined 数据
+TRAIN_FILE="prepared_data_2hop/train_2hop_mined.jsonl"
 EVAL_FILE="prepared_data_2hop/eval_2hop.jsonl"
 
 EXP_NAME="qwen2.5-3b-rl-anchored-chain"
@@ -15,15 +24,15 @@ OUTPUT_DIR="checkpoints/${EXP_NAME}"
 
 # Train
 MAX_STEPS=300
-PER_DEVICE_BSZ=2          # local prompts/GPU
-GRAD_ACCUM=4              # → effective 16 prompts × 4 gens = 64 seq/update
+PER_DEVICE_BSZ=2
+GRAD_ACCUM=4
 NUM_GEN=4
-LR=1e-6                   # ↑ from default 5e-7, 仍保守
+LR=1e-6
 WARMUP_RATIO=0.05
 
 # RL
 REWARD_MODE="chain_binary"
-KL_BETA=0.05              # ↑ from default 0.02 (paper uses 0.2 with anneal)
+KL_BETA=0.05
 TEMPERATURE=0.9
 TOP_P=0.95
 CLIP_RANGE=0.2
@@ -33,15 +42,32 @@ EVAL_STEPS=50
 EVAL_SUBSET=200
 SAVE_STEPS=50
 LOGGING_STEPS=10
+
+# ★ NEW: chunk size for token_logprobs.
+#   512 ≈ 5 GB peak per chunk on Qwen2.5-3B.
+#   If still OOM after this fix, lower to 256 or 128.
+LOGPROB_CHUNK=512
 # ==============================
 
 mkdir -p logs
+
+# ★ 自动备份旧的 RL 输出，避免与上次失败的 checkpoint-50 / best 混淆
+if [ -d "${OUTPUT_DIR}" ]; then
+    BACKUP="${OUTPUT_DIR}_FAILED_$(date +%Y%m%d_%H%M%S)"
+    echo "=========================================================="
+    echo " Found existing ${OUTPUT_DIR}"
+    echo " Backing up to:  ${BACKUP}"
+    echo "=========================================================="
+    mv "${OUTPUT_DIR}" "${BACKUP}"
+fi
 
 echo "=========================================================="
 echo " STEP 3: Anchored GRPO (chain_binary + KL=${KL_BETA})"
 echo " From:    ${SFT_CKPT}"
 echo " Data:    ${TRAIN_FILE} (mined hard subset)"
 echo " Output:  ${OUTPUT_DIR}"
+echo " Chunk:   logprob_chunk_size=${LOGPROB_CHUNK}"
+echo " Alloc:   PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF}"
 echo " Started: $(date)"
 echo "=========================================================="
 
@@ -49,6 +75,7 @@ accelerate launch \
     --num_processes ${N_GPUS} \
     --num_machines 1 \
     --mixed_precision bf16 \
+    --dynamo_backend no \
     rl_grpo_2hop.py \
         --model_name_or_path     ${SFT_CKPT} \
         --ref_model_name_or_path ${SFT_CKPT} \
@@ -82,6 +109,8 @@ accelerate launch \
         --save_steps                 ${SAVE_STEPS} \
         --save_best \
         --logging_steps              ${LOGGING_STEPS} \
+        \
+        --logprob_chunk_size         ${LOGPROB_CHUNK} \
     2>&1 | tee logs/rl_${EXP_NAME}.log
 
 echo ""
