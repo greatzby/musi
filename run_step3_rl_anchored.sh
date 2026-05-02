@@ -1,15 +1,15 @@
 #!/bin/bash
 # run_step3_rl_anchored.sh
 # Phase 3: Anchored GRPO from SFT-50, chain_binary reward + KL=0.05
-# v3.1: + PYTORCH_CUDA_ALLOC_CONF, set -o pipefail, auto-backup of old run
+# v3.2: per_device=1 + accum=8 (halve forward batch), aggressive empty_cache
 
 set -e
-set -o pipefail   # ← 让 tee 不吞掉错误，崩溃立即停
+set -o pipefail
 
-# ★ 关键环境变量：让 PyTorch 用新分配器，对 GRPO 这种频繁 alloc/free 极有效
+# expandable_segments 你的平台不支持，但留着也无害
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export NCCL_TIMEOUT=1800
-export NCCL_ASYNC_ERROR_HANDLING=1
+export TORCH_NCCL_ASYNC_ERROR_HANDLING=1     # ← 新名字（旧的 NCCL_ASYNC_ERROR_HANDLING 已 deprecated）
 export TOKENIZERS_PARALLELISM=false
 
 # ============ 配置 ============
@@ -22,10 +22,10 @@ EVAL_FILE="prepared_data_2hop/eval_2hop.jsonl"
 EXP_NAME="qwen2.5-3b-rl-anchored-chain"
 OUTPUT_DIR="checkpoints/${EXP_NAME}"
 
-# Train
+# Train  ★ v3.2: 单卡 micro batch 砍半，accum 翻倍，有效 batch 不变
 MAX_STEPS=300
-PER_DEVICE_BSZ=2
-GRAD_ACCUM=4
+PER_DEVICE_BSZ=1          # ← 从 2 改到 1
+GRAD_ACCUM=8              # ← 从 4 改到 8 (effective: 1 prompt × 8 accum × 2 GPU × 4 gen = 64 seq/update, 不变)
 NUM_GEN=4
 LR=1e-6
 WARMUP_RATIO=0.05
@@ -37,21 +37,20 @@ TEMPERATURE=0.9
 TOP_P=0.95
 CLIP_RANGE=0.2
 
-# Eval-during-training
+# Eval
 EVAL_STEPS=50
 EVAL_SUBSET=200
 SAVE_STEPS=50
 LOGGING_STEPS=10
 
-# ★ NEW: chunk size for token_logprobs.
-#   512 ≈ 5 GB peak per chunk on Qwen2.5-3B.
-#   If still OOM after this fix, lower to 256 or 128.
-LOGPROB_CHUNK=512
+# Memory ★ v3.2
+LOGPROB_CHUNK=256          # log_softmax 时间维 chunk 大小
+EMPTY_CACHE_STEPS=25       # 每 N optimizer step 强制清缓存
 # ==============================
 
 mkdir -p logs
 
-# ★ 自动备份旧的 RL 输出，避免与上次失败的 checkpoint-50 / best 混淆
+# 自动备份旧目录（含上次保存的 best/EM=70.00 这次不会丢）
 if [ -d "${OUTPUT_DIR}" ]; then
     BACKUP="${OUTPUT_DIR}_FAILED_$(date +%Y%m%d_%H%M%S)"
     echo "=========================================================="
@@ -62,12 +61,11 @@ if [ -d "${OUTPUT_DIR}" ]; then
 fi
 
 echo "=========================================================="
-echo " STEP 3: Anchored GRPO (chain_binary + KL=${KL_BETA})"
+echo " STEP 3: Anchored GRPO (chain_binary + KL=${KL_BETA}) v3.2"
 echo " From:    ${SFT_CKPT}"
-echo " Data:    ${TRAIN_FILE} (mined hard subset)"
+echo " Data:    ${TRAIN_FILE}"
 echo " Output:  ${OUTPUT_DIR}"
-echo " Chunk:   logprob_chunk_size=${LOGPROB_CHUNK}"
-echo " Alloc:   PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF}"
+echo " Memory:  per_dev=${PER_DEVICE_BSZ}  accum=${GRAD_ACCUM}  chunk=${LOGPROB_CHUNK}  empty_cache_every=${EMPTY_CACHE_STEPS}"
 echo " Started: $(date)"
 echo "=========================================================="
 
@@ -111,6 +109,7 @@ accelerate launch \
         --logging_steps              ${LOGGING_STEPS} \
         \
         --logprob_chunk_size         ${LOGPROB_CHUNK} \
+        --empty_cache_steps          ${EMPTY_CACHE_STEPS} \
     2>&1 | tee logs/rl_${EXP_NAME}.log
 
 echo ""
@@ -121,7 +120,6 @@ echo ""
 echo " Now running full OOD evaluation on best + final checkpoints..."
 echo ""
 
-# 自动评估关键 checkpoint
 python eval_compositional.py \
     --auto_discover ${OUTPUT_DIR} \
     --out_dir       eval_results_${EXP_NAME} \
