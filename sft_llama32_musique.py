@@ -2,23 +2,27 @@
 # -*- coding: utf-8 -*-
 
 """
-Matched MuSiQue SFT for unsloth/Llama-3.2-3B.
+Two-GPU-safe MuSiQue SFT for unsloth/Llama-3.2-3B.
 
 Supported target styles:
-  1. answer_only:
+  1. answer_only
        Answer: <final answer>
 
-  2. bridge_aware:
+  2. bridge_aware
        Bridge 1: <bridge>
        Bridge 2: <bridge>
        ...
        Answer: <final answer>
 
-Important:
-  - Both styles use exactly the same training examples.
-  - Logging occurs every 10 steps by default.
-  - No intermediate checkpoint is saved.
-  - Only OUTPUT_DIR/final is saved after training.
+Important properties:
+  - Supports single-GPU Python launch and multi-GPU torchrun launch.
+  - Intended multi-GPU command:
+        torchrun --standalone --nproc_per_node=2 sft_llama32_musique.py ...
+  - No DataLoader subprocesses by default.
+  - Logs every 10 optimizer steps by default.
+  - Does not save intermediate checkpoints.
+  - Saves only OUTPUT_DIR/final.
+  - Final saving is rank-safe under DDP.
 """
 
 from __future__ import annotations
@@ -26,6 +30,7 @@ from __future__ import annotations
 import argparse
 import inspect
 import json
+import os
 import random
 from dataclasses import dataclass
 from pathlib import Path
@@ -33,12 +38,10 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
+import transformers
 from datasets import Dataset
-from peft import (
-    LoraConfig,
-    TaskType,
-    get_peft_model,
-)
+from datasets.utils.logging import disable_progress_bar
+from peft import LoraConfig, TaskType, get_peft_model
 from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
@@ -68,6 +71,7 @@ ANSWER_ONLY_ANCHORED_PROMPT = (
     "Do not provide explanations or intermediate reasoning."
 )
 
+
 BRIDGE_AWARE_ANCHORED_PROMPT = (
     "Answer the multi-step question based strictly on the given passages.\n"
     "First identify the intermediate bridge answers needed to reach the "
@@ -80,6 +84,7 @@ BRIDGE_AWARE_ANCHORED_PROMPT = (
     "Do not add explanations outside these lines."
 )
 
+
 MINIMAL_PROMPT = (
     "Answer the question based strictly on the given passages. "
     "Keep the response concise."
@@ -89,6 +94,7 @@ MINIMAL_PROMPT = (
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
 
+    # Model and paths
     parser.add_argument(
         "--model_name",
         type=str,
@@ -105,6 +111,7 @@ def parse_args() -> argparse.Namespace:
         required=True,
     )
 
+    # Experiment settings
     parser.add_argument(
         "--target_style",
         choices=["answer_only", "bridge_aware"],
@@ -121,8 +128,17 @@ def parse_args() -> argparse.Namespace:
         default="anchored",
     )
 
-    parser.add_argument("--max_length", type=int, default=2048)
-    parser.add_argument("--max_steps", type=int, default=200)
+    # Sequence and training
+    parser.add_argument(
+        "--max_length",
+        type=int,
+        default=2048,
+    )
+    parser.add_argument(
+        "--max_steps",
+        type=int,
+        default=200,
+    )
     parser.add_argument(
         "--per_device_train_batch_size",
         type=int,
@@ -131,7 +147,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--gradient_accumulation_steps",
         type=int,
-        default=8,
+        default=4,
     )
     parser.add_argument(
         "--learning_rate",
@@ -158,23 +174,35 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default="cosine",
     )
-
     parser.add_argument(
         "--logging_steps",
         type=int,
         default=10,
     )
+
+    # Data processing
     parser.add_argument(
         "--num_proc",
         type=int,
-        default=4,
+        default=0,
+        help=(
+            "Number of Dataset.map subprocesses. "
+            "0 or 1 means no multiprocessing."
+        ),
     )
     parser.add_argument(
         "--dataloader_num_workers",
         type=int,
-        default=4,
+        default=0,
+        help="Keep at 0 for maximum cluster stability.",
+    )
+    parser.add_argument(
+        "--dataloader_pin_memory",
+        action=argparse.BooleanOptionalAction,
+        default=False,
     )
 
+    # Precision/runtime
     parser.add_argument(
         "--dtype",
         choices=["bf16", "fp16", "fp32"],
@@ -182,7 +210,11 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--attn_implementation",
-        choices=["sdpa", "eager", "flash_attention_2"],
+        choices=[
+            "sdpa",
+            "eager",
+            "flash_attention_2",
+        ],
         default="sdpa",
     )
     parser.add_argument(
@@ -195,31 +227,85 @@ def parse_args() -> argparse.Namespace:
         action=argparse.BooleanOptionalAction,
         default=True,
     )
+    parser.add_argument(
+        "--optim",
+        choices=[
+            "adamw_torch",
+            "adamw_torch_fused",
+        ],
+        default="adamw_torch",
+    )
 
-    # Set --lora_r 0 for full fine-tuning.
-    parser.add_argument("--lora_r", type=int, default=16)
-    parser.add_argument("--lora_alpha", type=int, default=32)
+    # LoRA; lora_r=0 means full fine-tuning.
+    parser.add_argument(
+        "--lora_r",
+        type=int,
+        default=16,
+    )
+    parser.add_argument(
+        "--lora_alpha",
+        type=int,
+        default=32,
+    )
     parser.add_argument(
         "--lora_dropout",
         type=float,
         default=0.05,
     )
 
-    parser.add_argument("--seed", type=int, default=42)
+    # DDP
+    parser.add_argument(
+        "--ddp_timeout",
+        type=int,
+        default=1800,
+    )
+    parser.add_argument(
+        "--ddp_bucket_cap_mb",
+        type=int,
+        default=25,
+    )
+
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=42,
+    )
 
     return parser.parse_args()
 
 
+def get_rank() -> int:
+    return int(os.environ.get("RANK", "0"))
+
+
+def get_local_rank() -> int:
+    return int(os.environ.get("LOCAL_RANK", "0"))
+
+
+def get_world_size() -> int:
+    return int(os.environ.get("WORLD_SIZE", "1"))
+
+
+def is_main_process() -> bool:
+    return get_rank() == 0
+
+
+def main_print(*args, **kwargs) -> None:
+    if is_main_process():
+        print(*args, **kwargs)
+
+
 def load_jsonl(path: Path) -> List[Dict]:
-    data: List[Dict] = []
+    examples: List[Dict] = []
 
     with path.open("r", encoding="utf-8") as file:
         for line in file:
             line = line.strip()
-            if line:
-                data.append(json.loads(line))
 
-    return data
+            if line:
+                examples.append(json.loads(line))
+
+    return examples
 
 
 def torch_dtype_from_name(name: str) -> torch.dtype:
@@ -241,19 +327,19 @@ def install_chat_template_if_needed(tokenizer) -> bool:
 
 
 def ensure_distinct_pad_token(tokenizer) -> Tuple[bool, int]:
-    eos_id = tokenizer.eos_token_id
+    eos_token_id = tokenizer.eos_token_id
 
     if (
         tokenizer.pad_token_id is not None
-        and tokenizer.pad_token_id != eos_id
+        and tokenizer.pad_token_id != eos_token_id
     ):
         return False, 0
 
-    preferred_pad = "<|finetune_right_pad_id|>"
+    preferred_pad_token = "<|finetune_right_pad_id|>"
     vocabulary = tokenizer.get_vocab()
 
-    if preferred_pad in vocabulary:
-        tokenizer.pad_token = preferred_pad
+    if preferred_pad_token in vocabulary:
+        tokenizer.pad_token = preferred_pad_token
 
         if tokenizer.pad_token_id == tokenizer.eos_token_id:
             raise RuntimeError(
@@ -268,10 +354,14 @@ def ensure_distinct_pad_token(tokenizer) -> Tuple[bool, int]:
     )
 
     if tokenizer.pad_token_id is None:
-        raise RuntimeError("Could not create a PAD token.")
+        raise RuntimeError(
+            "Failed to create a PAD token."
+        )
 
     if tokenizer.pad_token_id == tokenizer.eos_token_id:
-        raise RuntimeError("PAD and EOS must be distinct.")
+        raise RuntimeError(
+            "PAD and EOS token IDs must be distinct."
+        )
 
     return True, int(number_added)
 
@@ -308,17 +398,25 @@ def get_context_paragraphs(
     context_mode: str,
 ) -> List[Dict]:
     if context_mode == "gold":
-        paragraphs = example.get(
-            "gold_context_paragraphs",
-            example.get("context_paragraphs", []),
-        )
-    else:
-        paragraphs = example.get(
-            "all_context_paragraphs",
-            example.get("context_paragraphs", []),
+        return list(
+            example.get(
+                "gold_context_paragraphs",
+                example.get(
+                    "context_paragraphs",
+                    [],
+                ),
+            )
         )
 
-    return list(paragraphs)
+    return list(
+        example.get(
+            "all_context_paragraphs",
+            example.get(
+                "context_paragraphs",
+                [],
+            ),
+        )
+    )
 
 
 def paragraph_to_text(
@@ -344,10 +442,11 @@ def format_user_content(
     paragraph_blocks: List[str],
     question: str,
 ) -> str:
-    if paragraph_blocks:
-        context = "\n\n".join(paragraph_blocks)
-    else:
-        context = "(No passages provided.)"
+    context = (
+        "\n\n".join(paragraph_blocks)
+        if paragraph_blocks
+        else "(No passages provided.)"
+    )
 
     return f"{context}\n\nQuestion: {question}"
 
@@ -370,6 +469,7 @@ def format_target(
     ]
 
     lines.append(f"Answer: {final_answer}")
+
     return "\n".join(lines)
 
 
@@ -409,18 +509,16 @@ def fit_prompt_to_budget(
     question: str,
     maximum_prompt_tokens: int,
 ) -> Tuple[List[int], bool]:
-    full_prompt = render_prompt_ids(
+    full_prompt_ids = render_prompt_ids(
         tokenizer=tokenizer,
         system_prompt=system_prompt,
         paragraph_blocks=paragraph_blocks,
         question=question,
     )
 
-    if len(full_prompt) <= maximum_prompt_tokens:
-        return full_prompt, False
+    if len(full_prompt_ids) <= maximum_prompt_tokens:
+        return full_prompt_ids, False
 
-    # Preserve every paragraph by applying approximately the same
-    # token cap to every paragraph block.
     block_token_ids = [
         tokenizer(
             block,
@@ -435,11 +533,10 @@ def fit_prompt_to_budget(
 
     low = 0
     high = maximum_block_length
-    best_prompt: Optional[List[int]] = None
+    best_prompt_ids: Optional[List[int]] = None
 
     while low <= high:
         cap = (low + high) // 2
-
         cropped_blocks: List[str] = []
 
         for block_ids in block_token_ids:
@@ -456,54 +553,56 @@ def fit_prompt_to_budget(
                 )
             )
 
-        candidate = render_prompt_ids(
+        candidate_ids = render_prompt_ids(
             tokenizer=tokenizer,
             system_prompt=system_prompt,
             paragraph_blocks=cropped_blocks,
             question=question,
         )
 
-        if len(candidate) <= maximum_prompt_tokens:
-            best_prompt = candidate
+        if len(candidate_ids) <= maximum_prompt_tokens:
+            best_prompt_ids = candidate_ids
             low = cap + 1
         else:
             high = cap - 1
 
-    if best_prompt is not None:
-        return best_prompt, True
+    if best_prompt_ids is not None:
+        return best_prompt_ids, True
 
-    # Extreme fallback: preserve BOS and the end containing the question.
-    minimal_prompt = render_prompt_ids(
+    minimal_prompt_ids = render_prompt_ids(
         tokenizer=tokenizer,
         system_prompt=system_prompt,
         paragraph_blocks=[],
         question=question,
     )
 
-    if len(minimal_prompt) <= maximum_prompt_tokens:
-        return minimal_prompt, True
+    if len(minimal_prompt_ids) <= maximum_prompt_tokens:
+        return minimal_prompt_ids, True
 
     if maximum_prompt_tokens < 2:
         raise ValueError(
             "maximum_prompt_tokens is too small."
         )
 
+    bos_token_id = tokenizer.bos_token_id
+
     if (
-        tokenizer.bos_token_id is not None
-        and minimal_prompt[0] == tokenizer.bos_token_id
+        bos_token_id is not None
+        and minimal_prompt_ids
+        and minimal_prompt_ids[0] == bos_token_id
     ):
-        minimal_prompt = (
-            [minimal_prompt[0]]
-            + minimal_prompt[
+        minimal_prompt_ids = (
+            [minimal_prompt_ids[0]]
+            + minimal_prompt_ids[
                 -(maximum_prompt_tokens - 1):
             ]
         )
     else:
-        minimal_prompt = minimal_prompt[
+        minimal_prompt_ids = minimal_prompt_ids[
             -maximum_prompt_tokens:
         ]
 
-    return minimal_prompt, True
+    return minimal_prompt_ids, True
 
 
 def encode_example(
@@ -516,8 +615,8 @@ def encode_example(
     stop_token_id: int,
 ) -> Dict:
     target_text = format_target(
-        example,
-        target_style,
+        example=example,
+        target_style=target_style,
     )
 
     target_ids = tokenizer(
@@ -528,22 +627,24 @@ def encode_example(
     target_ids = list(map(int, target_ids))
     target_ids.append(int(stop_token_id))
 
-    maximum_prompt_tokens = max_length - len(target_ids)
+    maximum_prompt_tokens = (
+        max_length - len(target_ids)
+    )
 
     if maximum_prompt_tokens < 32:
         raise ValueError(
-            f"Target is too long for max_length={max_length}: "
-            f"target tokens={len(target_ids)}"
+            f"Target is too long for max_length={max_length}. "
+            f"Target length={len(target_ids)}."
         )
 
     paragraphs = get_context_paragraphs(
-        example,
-        context_mode,
+        example=example,
+        context_mode=context_mode,
     )
 
     paragraph_blocks = [
         paragraph_to_text(
-            paragraph,
+            paragraph=paragraph,
             paragraph_number=index,
         )
         for index, paragraph in enumerate(
@@ -555,8 +656,8 @@ def encode_example(
     prompt_ids, was_truncated = fit_prompt_to_budget(
         tokenizer=tokenizer,
         system_prompt=get_system_prompt(
-            target_style,
-            prompt_style,
+            target_style=target_style,
+            prompt_style=prompt_style,
         ),
         paragraph_blocks=paragraph_blocks,
         question=str(example["question"]),
@@ -571,8 +672,8 @@ def encode_example(
 
     if len(input_ids) > max_length:
         raise RuntimeError(
-            "Internal truncation error: encoded sequence "
-            f"has {len(input_ids)} tokens, max={max_length}."
+            "Internal tokenization error: "
+            f"{len(input_ids)} > {max_length}."
         )
 
     return {
@@ -597,9 +698,9 @@ class SupervisedDataCollator:
             for example in batch
         )
 
-        input_ids: List[List[int]] = []
-        attention_masks: List[List[int]] = []
-        labels: List[List[int]] = []
+        batch_input_ids: List[List[int]] = []
+        batch_attention_masks: List[List[int]] = []
+        batch_labels: List[List[int]] = []
 
         for example in batch:
             padding_length = (
@@ -607,32 +708,32 @@ class SupervisedDataCollator:
                 - len(example["input_ids"])
             )
 
-            input_ids.append(
+            batch_input_ids.append(
                 example["input_ids"]
                 + [self.pad_token_id] * padding_length
             )
 
-            attention_masks.append(
+            batch_attention_masks.append(
                 example["attention_mask"]
                 + [0] * padding_length
             )
 
-            labels.append(
+            batch_labels.append(
                 example["labels"]
                 + [-100] * padding_length
             )
 
         return {
             "input_ids": torch.tensor(
-                input_ids,
+                batch_input_ids,
                 dtype=torch.long,
             ),
             "attention_mask": torch.tensor(
-                attention_masks,
+                batch_attention_masks,
                 dtype=torch.long,
             ),
             "labels": torch.tensor(
-                labels,
+                batch_labels,
                 dtype=torch.long,
             ),
         }
@@ -641,34 +742,66 @@ class SupervisedDataCollator:
 def build_trainer(
     model,
     tokenizer,
-    training_args,
-    train_dataset,
-    data_collator,
+    training_args: TrainingArguments,
+    train_dataset: Dataset,
+    data_collator: SupervisedDataCollator,
 ) -> Trainer:
-    kwargs = {
+    trainer_arguments = {
         "model": model,
         "args": training_args,
         "train_dataset": train_dataset,
         "data_collator": data_collator,
     }
 
-    signature = inspect.signature(
+    trainer_signature = inspect.signature(
         Trainer.__init__
     )
 
-    if "processing_class" in signature.parameters:
-        kwargs["processing_class"] = tokenizer
+    if (
+        "processing_class"
+        in trainer_signature.parameters
+    ):
+        trainer_arguments["processing_class"] = tokenizer
     else:
-        kwargs["tokenizer"] = tokenizer
+        trainer_arguments["tokenizer"] = tokenizer
 
-    return Trainer(**kwargs)
+    return Trainer(**trainer_arguments)
+
+
+def make_json_safe(value):
+    if isinstance(value, np.generic):
+        return value.item()
+
+    if isinstance(value, torch.Tensor):
+        return value.detach().cpu().item()
+
+    if isinstance(value, dict):
+        return {
+            str(key): make_json_safe(item)
+            for key, item in value.items()
+        }
+
+    if isinstance(value, (list, tuple)):
+        return [
+            make_json_safe(item)
+            for item in value
+        ]
+
+    return value
 
 
 def main() -> None:
     args = parse_args()
 
-    random.seed(args.seed)
-    np.random.seed(args.seed)
+    rank = get_rank()
+    local_rank = get_local_rank()
+    world_size = get_world_size()
+
+    if not is_main_process():
+        disable_progress_bar()
+
+    random.seed(args.seed + rank)
+    np.random.seed(args.seed + rank)
     set_seed(args.seed)
 
     torch.backends.cuda.matmul.allow_tf32 = True
@@ -679,45 +812,79 @@ def main() -> None:
     except Exception:
         pass
 
-    if args.dtype == "bf16":
-        if (
-            torch.cuda.is_available()
-            and not torch.cuda.is_bf16_supported()
-        ):
-            raise RuntimeError(
-                "The selected GPU does not support BF16. "
-                "Use --dtype fp16."
-            )
+    if not torch.cuda.is_available():
+        raise RuntimeError(
+            "CUDA is required for this training script."
+        )
+
+    if (
+        args.dtype == "bf16"
+        and not torch.cuda.is_bf16_supported()
+    ):
+        raise RuntimeError(
+            "The selected GPU does not support BF16. "
+            "Use --dtype fp16."
+        )
 
     train_path = Path(
         args.train_file
     ).expanduser().resolve()
 
+    if not train_path.exists():
+        raise FileNotFoundError(train_path)
+
     output_dir = Path(
         args.output_dir
     ).expanduser().resolve()
-    output_dir.mkdir(parents=True, exist_ok=True)
 
     final_dir = output_dir / "final"
 
+    # It is okay for output_dir to exist after a failed run,
+    # but do not overwrite a completed final model.
     if final_dir.exists():
         raise FileExistsError(
-            f"Final model directory already exists: {final_dir}\n"
-            "Use a new --output_dir or remove the old directory."
+            f"Final model already exists: {final_dir}\n"
+            "Use a different output directory or remove it explicitly."
         )
 
-    print("=" * 80)
-    print("Llama-3.2-3B MuSiQue SFT")
-    print(f"Model          : {args.model_name}")
-    print(f"Target style   : {args.target_style}")
-    print(f"Context mode   : {args.context_mode}")
-    print(f"Prompt style   : {args.prompt_style}")
-    print(f"Training file  : {train_path}")
-    print(f"Output         : {output_dir}")
-    print(f"Max steps      : {args.max_steps}")
-    print(f"Logging steps  : {args.logging_steps}")
-    print(f"LoRA rank      : {args.lora_r}")
-    print("=" * 80)
+    output_dir.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    effective_global_batch_size = (
+        args.per_device_train_batch_size
+        * args.gradient_accumulation_steps
+        * world_size
+    )
+
+    main_print("=" * 88)
+    main_print("Llama-3.2-3B MuSiQue SFT")
+    main_print(f"Transformers       : {transformers.__version__}")
+    main_print(f"PyTorch            : {torch.__version__}")
+    main_print(f"Model              : {args.model_name}")
+    main_print(f"Target style       : {args.target_style}")
+    main_print(f"Context mode       : {args.context_mode}")
+    main_print(f"Prompt style       : {args.prompt_style}")
+    main_print(f"Training file      : {train_path}")
+    main_print(f"Output             : {output_dir}")
+    main_print(f"World size         : {world_size}")
+    main_print(f"Per-device batch   : {args.per_device_train_batch_size}")
+    main_print(f"Gradient accum.    : {args.gradient_accumulation_steps}")
+    main_print(f"Global batch       : {effective_global_batch_size}")
+    main_print(f"Max steps          : {args.max_steps}")
+    main_print(f"Logging steps      : {args.logging_steps}")
+    main_print(f"Attention          : {args.attn_implementation}")
+    main_print(f"Optimizer          : {args.optim}")
+    main_print(f"DataLoader workers : {args.dataloader_num_workers}")
+    main_print(f"LoRA rank          : {args.lora_r}")
+    main_print("=" * 88)
+
+    print(
+        f"[rank={rank} local_rank={local_rank}] "
+        f"CUDA device={torch.cuda.current_device()}",
+        flush=True,
+    )
 
     tokenizer = AutoTokenizer.from_pretrained(
         args.model_name,
@@ -725,12 +892,12 @@ def main() -> None:
         trust_remote_code=args.trust_remote_code,
     )
 
-    installed_template = (
+    installed_chat_template = (
         install_chat_template_if_needed(tokenizer)
     )
 
-    pad_changed, tokens_added = ensure_distinct_pad_token(
-        tokenizer
+    pad_changed, tokens_added = (
+        ensure_distinct_pad_token(tokenizer)
     )
 
     tokenizer.padding_side = "right"
@@ -738,19 +905,27 @@ def main() -> None:
 
     stop_token_id = get_stop_token_id(tokenizer)
 
-    print(f"Installed chat template: {installed_template}")
-    print(f"PAD changed            : {pad_changed}")
-    print(f"PAD token              : {tokenizer.pad_token!r}")
-    print(f"PAD token id           : {tokenizer.pad_token_id}")
-    print(f"EOS token              : {tokenizer.eos_token!r}")
-    print(f"EOS token id           : {tokenizer.eos_token_id}")
-    print(f"Stop token id          : {stop_token_id}")
+    main_print(
+        f"Installed chat template: "
+        f"{installed_chat_template}"
+    )
+    main_print(f"PAD changed            : {pad_changed}")
+    main_print(f"PAD token              : {tokenizer.pad_token!r}")
+    main_print(f"PAD token id           : {tokenizer.pad_token_id}")
+    main_print(f"EOS token              : {tokenizer.eos_token!r}")
+    main_print(f"EOS token id           : {tokenizer.eos_token_id}")
+    main_print(f"Stop token id          : {stop_token_id}")
 
     raw_examples = load_jsonl(train_path)
-    print(f"Loaded {len(raw_examples)} examples")
+    main_print(f"Loaded {len(raw_examples)} examples")
 
-    raw_dataset = Dataset.from_list(
-        raw_examples
+    raw_dataset = Dataset.from_list(raw_examples)
+
+    # num_proc=None means no Dataset.map subprocess.
+    map_num_proc = (
+        args.num_proc
+        if args.num_proc > 1
+        else None
     )
 
     encoded_dataset = raw_dataset.map(
@@ -764,8 +939,12 @@ def main() -> None:
             stop_token_id=stop_token_id,
         ),
         remove_columns=raw_dataset.column_names,
-        num_proc=args.num_proc,
-        desc="Tokenizing",
+        num_proc=map_num_proc,
+        desc=(
+            "Tokenizing"
+            if is_main_process()
+            else None
+        ),
     )
 
     encoded_dataset = encoded_dataset.filter(
@@ -773,48 +952,55 @@ def main() -> None:
             label != -100
             for label in example["labels"]
         ),
-        num_proc=args.num_proc,
-        desc="Filtering empty targets",
+        num_proc=map_num_proc,
+        desc=(
+            "Filtering empty targets"
+            if is_main_process()
+            else None
+        ),
     )
 
     lengths = encoded_dataset["length"]
-    truncated = encoded_dataset["truncated"]
+    truncated_flags = encoded_dataset["truncated"]
 
-    print(f"Encoded examples : {len(encoded_dataset)}")
-    print(f"Minimum length   : {min(lengths)}")
-    print(f"Maximum length   : {max(lengths)}")
-    print(
+    main_print(f"Encoded examples : {len(encoded_dataset)}")
+    main_print(f"Minimum length   : {min(lengths)}")
+    main_print(f"Maximum length   : {max(lengths)}")
+    main_print(
         "Mean length      : "
         f"{sum(lengths) / len(lengths):.1f}"
     )
-    print(
+    main_print(
         "Truncated        : "
-        f"{sum(truncated)}/{len(truncated)}"
+        f"{sum(truncated_flags)}/{len(truncated_flags)}"
     )
 
     model_dtype = torch_dtype_from_name(
         args.dtype
     )
 
+    # Transformers 4.57 uses dtype rather than torch_dtype.
     model = AutoModelForCausalLM.from_pretrained(
         args.model_name,
-        torch_dtype=model_dtype,
+        dtype=model_dtype,
         attn_implementation=args.attn_implementation,
         trust_remote_code=args.trust_remote_code,
+        low_cpu_mem_usage=True,
     )
 
-    embedding_size = int(
+    original_embedding_size = int(
         model.get_input_embeddings().weight.shape[0]
     )
 
     if (
-        embedding_size != len(tokenizer)
+        original_embedding_size != len(tokenizer)
         or tokens_added > 0
     ):
-        print(
-            f"Resizing token embeddings: "
-            f"{embedding_size} -> {len(tokenizer)}"
+        main_print(
+            "Resizing token embeddings: "
+            f"{original_embedding_size} -> {len(tokenizer)}"
         )
+
         model.resize_token_embeddings(
             len(tokenizer)
         )
@@ -822,13 +1008,25 @@ def main() -> None:
     model.config.pad_token_id = (
         tokenizer.pad_token_id
     )
+    model.config.use_cache = False
 
     if tokenizer.eos_token_id is not None:
         model.config.eos_token_id = (
             tokenizer.eos_token_id
         )
 
-    model.config.use_cache = False
+    if (
+        hasattr(model, "generation_config")
+        and model.generation_config is not None
+    ):
+        model.generation_config.pad_token_id = (
+            tokenizer.pad_token_id
+        )
+
+        if tokenizer.eos_token_id is not None:
+            model.generation_config.eos_token_id = (
+                tokenizer.eos_token_id
+            )
 
     if args.lora_r > 0:
         modules_to_save: Optional[List[str]] = None
@@ -839,7 +1037,7 @@ def main() -> None:
                 "lm_head",
             ]
 
-        lora_config = LoraConfig(
+        lora_configuration = LoraConfig(
             task_type=TaskType.CAUSAL_LM,
             r=args.lora_r,
             lora_alpha=args.lora_alpha,
@@ -859,40 +1057,43 @@ def main() -> None:
 
         model = get_peft_model(
             model,
-            lora_config,
+            lora_configuration,
         )
-        model.print_trainable_parameters()
+
+        if is_main_process():
+            model.print_trainable_parameters()
     else:
-        trainable = sum(
+        trainable_parameters = sum(
             parameter.numel()
             for parameter in model.parameters()
             if parameter.requires_grad
         )
-        print(
-            f"Full fine-tuning enabled: "
-            f"{trainable:,} trainable parameters"
+
+        main_print(
+            "Full fine-tuning enabled: "
+            f"{trainable_parameters:,} trainable parameters"
         )
 
-    if args.gradient_checkpointing:
-        model.gradient_checkpointing_enable(
-            gradient_checkpointing_kwargs={
-                "use_reentrant": False
-            }
-        )
-
-        if hasattr(
+    # Required for PEFT + gradient checkpointing when base
+    # embeddings are frozen.
+    if (
+        args.gradient_checkpointing
+        and hasattr(
             model,
             "enable_input_require_grads",
-        ):
-            model.enable_input_require_grads()
+        )
+    ):
+        model.enable_input_require_grads()
 
     use_bf16 = args.dtype == "bf16"
     use_fp16 = args.dtype == "fp16"
 
     training_args = TrainingArguments(
         output_dir=str(output_dir),
+        overwrite_output_dir=True,
 
         max_steps=args.max_steps,
+
         per_device_train_batch_size=(
             args.per_device_train_batch_size
         ),
@@ -906,6 +1107,8 @@ def main() -> None:
         weight_decay=args.weight_decay,
         max_grad_norm=args.max_grad_norm,
 
+        optim=args.optim,
+
         bf16=use_bf16,
         fp16=use_fp16,
         tf32=True,
@@ -913,24 +1116,40 @@ def main() -> None:
         gradient_checkpointing=(
             args.gradient_checkpointing
         ),
+        gradient_checkpointing_kwargs=(
+            {"use_reentrant": False}
+            if args.gradient_checkpointing
+            else None
+        ),
 
         logging_strategy="steps",
         logging_steps=args.logging_steps,
         logging_first_step=True,
 
-        # No intermediate checkpoints.
+        # No checkpoint-10/checkpoint-50/etc.
         save_strategy="no",
+        save_safetensors=True,
 
         report_to="none",
+
         dataloader_num_workers=(
             args.dataloader_num_workers
         ),
-        dataloader_pin_memory=True,
+        dataloader_pin_memory=(
+            args.dataloader_pin_memory
+        ),
+        dataloader_persistent_workers=False,
+
+        # DDP-safe settings for gradient checkpointing.
+        ddp_backend="nccl",
+        ddp_find_unused_parameters=False,
+        ddp_broadcast_buffers=False,
+        ddp_bucket_cap_mb=args.ddp_bucket_cap_mb,
+        ddp_timeout=args.ddp_timeout,
 
         seed=args.seed,
         data_seed=args.seed,
 
-        ddp_find_unused_parameters=False,
         remove_unused_columns=False,
     )
 
@@ -948,75 +1167,86 @@ def main() -> None:
 
     train_result = trainer.train()
 
-    # Save only the final model/adapter.
-    final_dir.mkdir(
-        parents=True,
-        exist_ok=False,
-    )
+    # Wait until all ranks finish training.
+    trainer.accelerator.wait_for_everyone()
 
+    # Trainer.save_model is distributed-aware and only writes
+    # from the process that should save.
     trainer.save_model(str(final_dir))
-    tokenizer.save_pretrained(final_dir)
 
-    experiment_config = {
-        **vars(args),
-        "train_file_resolved": str(train_path),
-        "final_dir": str(final_dir),
-        "number_of_examples": len(
-            encoded_dataset
-        ),
-        "minimum_length": int(min(lengths)),
-        "maximum_length": int(max(lengths)),
-        "mean_length": float(
-            sum(lengths) / len(lengths)
-        ),
-        "number_truncated": int(
-            sum(truncated)
-        ),
-        "effective_batch_size_per_process": int(
-            args.per_device_train_batch_size
-            * args.gradient_accumulation_steps
-        ),
-        "pad_token_id": int(
-            tokenizer.pad_token_id
-        ),
-        "eos_token_id": (
-            int(tokenizer.eos_token_id)
-            if tokenizer.eos_token_id is not None
-            else None
-        ),
-        "stop_token_id": int(stop_token_id),
-        "installed_chat_template": bool(
-            installed_template
-        ),
-        "train_metrics": {
-            key: float(value)
-            if isinstance(value, (int, float))
-            else value
-            for key, value in train_result.metrics.items()
-        },
-    }
+    trainer.accelerator.wait_for_everyone()
 
-    for directory in [output_dir, final_dir]:
-        with (
-            directory / "experiment_config.json"
-        ).open("w", encoding="utf-8") as file:
-            json.dump(
-                experiment_config,
-                file,
-                indent=2,
-                ensure_ascii=False,
-            )
+    if trainer.is_world_process_zero():
+        tokenizer.save_pretrained(final_dir)
 
-    trainer.save_state()
+        experiment_config = {
+            **vars(args),
+            "train_file_resolved": str(train_path),
+            "output_dir_resolved": str(output_dir),
+            "final_dir": str(final_dir),
+            "world_size": int(world_size),
+            "effective_global_batch_size": int(
+                effective_global_batch_size
+            ),
+            "number_of_examples": int(
+                len(encoded_dataset)
+            ),
+            "minimum_length": int(min(lengths)),
+            "maximum_length": int(max(lengths)),
+            "mean_length": float(
+                sum(lengths) / len(lengths)
+            ),
+            "number_truncated": int(
+                sum(truncated_flags)
+            ),
+            "pad_token_id": int(
+                tokenizer.pad_token_id
+            ),
+            "eos_token_id": (
+                int(tokenizer.eos_token_id)
+                if tokenizer.eos_token_id is not None
+                else None
+            ),
+            "stop_token_id": int(stop_token_id),
+            "installed_chat_template": bool(
+                installed_chat_template
+            ),
+            "train_metrics": make_json_safe(
+                train_result.metrics
+            ),
+            "versions": {
+                "torch": torch.__version__,
+                "transformers": transformers.__version__,
+            },
+        }
 
-    print("\n" + "=" * 80)
-    print("Training complete")
-    print(f"Final model: {final_dir}")
-    print(
-        "No intermediate checkpoint-* directories "
-        "were created."
-    )
-    print("=" * 80)
+        for directory in [
+            output_dir,
+            final_dir,
+        ]:
+            with (
+                directory / "experiment_config.json"
+            ).open(
+                "w",
+                encoding="utf-8",
+            ) as file:
+                json.dump(
+                    experiment_config,
+                    file,
+                    indent=2,
+                    ensure_ascii=False,
+                )
+
+        print("\n" + "=" * 88)
+        print("Training complete")
+        print(f"Final model: {final_dir}")
+        print(
+            "No intermediate checkpoint-* "
+            "directories were created."
+        )
+        print("=" * 88)
+
+    trainer.accelerator.wait_for_everyone()
 
 
 if __name__ == "__main__":
