@@ -2,11 +2,7 @@
 
 set -Eeuo pipefail
 
-SCRIPT_DIR="$(
-    cd "$(dirname "${BASH_SOURCE[0]}")"
-    pwd
-)"
-
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 cd "${SCRIPT_DIR}"
 
 # ============================================================
@@ -56,13 +52,8 @@ SEEDS_STRING="${SEEDS:-42}"
 
 # Default full factorial:
 #   2 targets × 2 prompts × 2 bases = 8 models.
-TARGET_STYLES_STRING="${
-    TARGET_STYLES:-answer_only bridge_aware
-}"
-
-PROMPT_STYLES_STRING="${
-    PROMPT_STYLES:-canonical anchored
-}"
+TARGET_STYLES_STRING="${TARGET_STYLES:-answer_only bridge_aware}"
+PROMPT_STYLES_STRING="${PROMPT_STYLES:-canonical anchored}"
 
 # Smoke test both base models before launching all runs.
 RUN_SMOKE="${RUN_SMOKE:-1}"
@@ -96,14 +87,9 @@ if [[ "${OFFLINE}" == "1" ]]; then
     LOCAL_FLAGS+=(--local_files_only)
 fi
 
-read -r -a SEED_ARRAY \
-    <<< "${SEEDS_STRING}"
-
-read -r -a TARGET_STYLE_ARRAY \
-    <<< "${TARGET_STYLES_STRING}"
-
-read -r -a PROMPT_STYLE_ARRAY \
-    <<< "${PROMPT_STYLES_STRING}"
+read -r -a SEED_ARRAY <<< "${SEEDS_STRING}"
+read -r -a TARGET_STYLE_ARRAY <<< "${TARGET_STYLES_STRING}"
+read -r -a PROMPT_STYLE_ARRAY <<< "${PROMPT_STYLES_STRING}"
 
 MODEL_KEYS=(
     "qwen25-3b"
@@ -122,22 +108,22 @@ MODEL_NAMES=(
 echo "============================================================"
 echo "MuSiQue SFT factorial experiment"
 echo "============================================================"
-echo "Qwen model          : ${QWEN_MODEL}"
-echo "Llama model         : ${LLAMA_MODEL}"
-echo "Data directory      : ${DATA_DIR}"
-echo "Training file       : ${TRAIN_FILE}"
-echo "GPU list            : ${GPU_LIST}"
-echo "Number of GPUs      : ${NUM_GPUS}"
-echo "Global batch        : $((PER_DEVICE_BATCH * GRAD_ACCUM * NUM_GPUS))"
-echo "Maximum steps       : ${MAX_STEPS}"
-echo "Learning rate       : ${LEARNING_RATE}"
-echo "Warmup steps        : ${WARMUP_STEPS}"
-echo "Seeds               : ${SEED_ARRAY[*]}"
-echo "Target styles       : ${TARGET_STYLE_ARRAY[*]}"
-echo "Prompt styles       : ${PROMPT_STYLE_ARRAY[*]}"
-echo "Offline             : ${OFFLINE}"
-echo "Checkpoint root     : ${ROOT_DIR}"
-echo "Evaluation output   : ${EVAL_OUT_DIR}"
+echo "Qwen model           : ${QWEN_MODEL}"
+echo "Llama model          : ${LLAMA_MODEL}"
+echo "Data directory       : ${DATA_DIR}"
+echo "Training file        : ${TRAIN_FILE}"
+echo "GPU list             : ${GPU_LIST}"
+echo "Number of GPUs       : ${NUM_GPUS}"
+echo "Global batch         : $((PER_DEVICE_BATCH * GRAD_ACCUM * NUM_GPUS))"
+echo "Maximum steps        : ${MAX_STEPS}"
+echo "Learning rate        : ${LEARNING_RATE}"
+echo "Warmup steps         : ${WARMUP_STEPS}"
+echo "Seeds                : ${SEED_ARRAY[*]}"
+echo "Target styles        : ${TARGET_STYLE_ARRAY[*]}"
+echo "Prompt styles        : ${PROMPT_STYLE_ARRAY[*]}"
+echo "Offline              : ${OFFLINE}"
+echo "Checkpoint root      : ${ROOT_DIR}"
+echo "Evaluation output    : ${EVAL_OUT_DIR}"
 echo "============================================================"
 
 python - <<'PY'
@@ -169,6 +155,17 @@ for required_file in "${REQUIRED_FILES[@]}"; do
         exit 1
     fi
 done
+
+# Validate GPU configuration.
+IFS=',' read -r -a GPU_ID_ARRAY <<< "${GPU_LIST}"
+
+if [[ "${#GPU_ID_ARRAY[@]}" -ne "${NUM_GPUS}" ]]; then
+    echo "ERROR: GPU_LIST and NUM_GPUS disagree."
+    echo "  GPU_LIST=${GPU_LIST}"
+    echo "  NUM_GPUS=${NUM_GPUS}"
+    echo "  Parsed GPU count=${#GPU_ID_ARRAY[@]}"
+    exit 1
+fi
 
 # ============================================================
 # Helper: one DDP smoke test
@@ -223,7 +220,7 @@ smoke_test_one() {
             2>&1 | tee "${smoke_log}"
     then
         if [[ ! -d "${smoke_dir}/final" ]]; then
-            echo "ERROR: smoke test produced no final model."
+            echo "ERROR: smoke test returned success but produced no final model."
             exit 1
         fi
     else
@@ -250,15 +247,7 @@ train_one() {
     local seed="$5"
 
     local run_name
-    run_name="${
-        base_key
-    }__${
-        target_style
-    }__${
-        prompt_style
-    }__seed${
-        seed
-    }"
+    run_name="${base_key}__${target_style}__${prompt_style}__seed${seed}"
 
     local output_dir="${ROOT_DIR}/${run_name}"
     local log_file="${LOG_DIR}/${run_name}.log"
@@ -348,7 +337,7 @@ if [[ "${RUN_SMOKE}" == "1" ]]; then
             "${MODEL_NAMES[$index]}"
     done
 else
-    echo "Skipping smoke tests."
+    echo "Skipping smoke tests because RUN_SMOKE=${RUN_SMOKE}"
 fi
 
 # ============================================================
@@ -383,16 +372,7 @@ for seed in "${SEED_ARRAY[@]}"; do
     for base_key in "${MODEL_KEYS[@]}"; do
         for target_style in "${TARGET_STYLE_ARRAY[@]}"; do
             for prompt_style in "${PROMPT_STYLE_ARRAY[@]}"; do
-                run_name="${
-                    base_key
-                }__${
-                    target_style
-                }__${
-                    prompt_style
-                }__seed${
-                    seed
-                }"
-
+                run_name="${base_key}__${target_style}__${prompt_style}__seed${seed}"
                 final_dir="${ROOT_DIR}/${run_name}/final"
 
                 if [[ -d "${final_dir}" ]]; then
@@ -408,9 +388,13 @@ echo "============================================================"
 echo "Completed models"
 echo "============================================================"
 
-for model_dir in "${MODEL_DIRS[@]}"; do
-    echo "  ${model_dir}"
-done
+if [[ "${#MODEL_DIRS[@]}" -gt 0 ]]; then
+    for model_dir in "${MODEL_DIRS[@]}"; do
+        echo "  ${model_dir}"
+    done
+else
+    echo "  None"
+fi
 
 echo "Number completed: ${#MODEL_DIRS[@]}"
 
@@ -467,12 +451,12 @@ echo ""
 echo "============================================================"
 echo "Experiment finished"
 echo "============================================================"
-echo "Checkpoint root : ${ROOT_DIR}"
-echo "Logs            : ${LOG_DIR}"
-echo "Evaluation      : ${EVAL_OUT_DIR}"
-echo "Completed models: ${#MODEL_DIRS[@]}"
-echo "Training failures: ${#FAILED_RUNS[@]}"
-echo "Evaluation failed: ${EVAL_FAILED}"
+echo "Checkpoint root   : ${ROOT_DIR}"
+echo "Logs              : ${LOG_DIR}"
+echo "Evaluation        : ${EVAL_OUT_DIR}"
+echo "Completed models  : ${#MODEL_DIRS[@]}"
+echo "Training failures : ${#FAILED_RUNS[@]}"
+echo "Evaluation failed : ${EVAL_FAILED}"
 
 if [[ "${#FAILED_RUNS[@]}" -gt 0 ]]; then
     echo ""
@@ -483,10 +467,7 @@ if [[ "${#FAILED_RUNS[@]}" -gt 0 ]]; then
     done
 fi
 
-if (
-    [[ "${#FAILED_RUNS[@]}" -eq 0 ]]
-    && [[ "${EVAL_FAILED}" -eq 0 ]]
-); then
+if [[ "${#FAILED_RUNS[@]}" -eq 0 && "${EVAL_FAILED}" -eq 0 ]]; then
     date -Is > "${LOG_DIR}/ALL_DONE.txt"
     echo "Status: ALL DONE"
     exit 0
