@@ -79,7 +79,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--out_dir",
         type=str,
-        default="eval_results/musique_factorial",
+        default=(
+            "eval_results/"
+            "musique-two-base-factorial-v3"
+        ),
     )
     parser.add_argument(
         "--splits",
@@ -167,7 +170,9 @@ def normalize_answer(
     if text is None:
         return ""
 
-    def remove_articles(value: str) -> str:
+    def remove_articles(
+        value: str,
+    ) -> str:
         return re.sub(
             r"\b(a|an|the)\b",
             " ",
@@ -187,19 +192,12 @@ def normalize_answer(
             if character not in punctuation
         )
 
-    def normalize_whitespace(
-        value: str,
-    ) -> str:
-        return " ".join(
-            value.split()
-        )
-
-    return normalize_whitespace(
+    return " ".join(
         remove_articles(
             remove_punctuation(
                 text.lower()
             )
-        )
+        ).split()
     )
 
 
@@ -207,13 +205,17 @@ def pair_f1(
     prediction: str,
     gold: str,
 ) -> float:
-    prediction_tokens = normalize_answer(
-        prediction
-    ).split()
+    prediction_tokens = (
+        normalize_answer(
+            prediction
+        ).split()
+    )
 
-    gold_tokens = normalize_answer(
-        gold
-    ).split()
+    gold_tokens = (
+        normalize_answer(
+            gold
+        ).split()
+    )
 
     if (
         not prediction_tokens
@@ -259,7 +261,9 @@ def exact_match(
     gold_answers: List[str],
 ) -> float:
     normalized_prediction = (
-        normalize_answer(prediction)
+        normalize_answer(
+            prediction
+        )
     )
 
     return float(
@@ -318,22 +322,14 @@ def parse_output(
         )
 
         if bridge_match:
-            bridge_index = int(
-                bridge_match.group(1)
-            )
-
-            bridge_value = (
-                bridge_match.group(2)
-                .strip()
-            )
-
             indexed_bridges.append(
                 (
-                    bridge_index,
-                    bridge_value,
+                    int(
+                        bridge_match.group(1)
+                    ),
+                    bridge_match.group(2).strip(),
                 )
             )
-
             continue
 
         answer_match = RE_ANSWER.match(
@@ -348,7 +344,6 @@ def parse_output(
                 answer_match.group(1)
                 .strip()
             )
-
             found_answer_label = True
 
     indexed_bridges.sort(
@@ -379,11 +374,15 @@ def bridge_matches(
     gold: str,
 ) -> bool:
     normalized_prediction = (
-        normalize_answer(prediction)
+        normalize_answer(
+            prediction
+        )
     )
 
     normalized_gold = (
-        normalize_answer(gold)
+        normalize_answer(
+            gold
+        )
     )
 
     if (
@@ -454,7 +453,8 @@ def compute_bridge_metrics(
             for predicted_bridge
             in predicted_bridges
         )
-        for gold_bridge in gold_bridges
+        for gold_bridge
+        in gold_bridges
     )
 
     per_gold_f1 = [
@@ -499,12 +499,16 @@ def get_gold_answers(
 
     if example.get("final_answer"):
         answers.append(
-            str(example["final_answer"])
+            str(
+                example["final_answer"]
+            )
         )
 
     if example.get("answer"):
         answers.append(
-            str(example["answer"])
+            str(
+                example["answer"]
+            )
         )
 
     for alias in example.get(
@@ -549,7 +553,9 @@ def get_eos_token_ids(
         )
 
         if eos_id not in token_ids:
-            token_ids.append(eos_id)
+            token_ids.append(
+                eos_id
+            )
 
     if not token_ids:
         raise RuntimeError(
@@ -568,17 +574,20 @@ def load_model_and_tokenizer(
     local_files_only: bool,
 ):
     tokenizer = AutoTokenizer.from_pretrained(
-        model_dir,
+        str(model_dir),
         use_fast=True,
         trust_remote_code=True,
-        local_files_only=local_files_only,
+        local_files_only=(
+            local_files_only
+        ),
     )
 
     install_chat_template_if_needed(
         tokenizer
     )
-
-    ensure_pad_token(tokenizer)
+    ensure_pad_token(
+        tokenizer
+    )
 
     tokenizer.padding_side = "left"
     tokenizer.truncation_side = "left"
@@ -591,7 +600,7 @@ def load_model_and_tokenizer(
     if adapter_config_path.exists():
         peft_config = (
             PeftConfig.from_pretrained(
-                model_dir
+                str(model_dir)
             )
         )
 
@@ -628,21 +637,43 @@ def load_model_and_tokenizer(
             .weight.shape[0]
         )
 
-        if embedding_size != len(tokenizer):
+        if (
+            len(tokenizer)
+            > embedding_size
+        ):
+            print(
+                "Expanding base-model token "
+                "embeddings: "
+                f"{embedding_size} "
+                f"-> {len(tokenizer)}"
+            )
+
             base_model.resize_token_embeddings(
                 len(tokenizer)
             )
 
+        elif (
+            len(tokenizer)
+            < embedding_size
+        ):
+            print(
+                "Keeping base-model vocabulary "
+                "unchanged: "
+                f"model={embedding_size}, "
+                f"tokenizer={len(tokenizer)}"
+            )
+
         model = PeftModel.from_pretrained(
             base_model,
-            model_dir,
+            str(model_dir),
             is_trainable=False,
         )
+
     else:
         model = (
             AutoModelForCausalLM
             .from_pretrained(
-                model_dir,
+                str(model_dir),
                 dtype=dtype,
                 attn_implementation=(
                     attn_implementation
@@ -658,7 +689,6 @@ def load_model_and_tokenizer(
     model.config.pad_token_id = (
         tokenizer.pad_token_id
     )
-
     model.config.use_cache = True
 
     if (
@@ -672,12 +702,13 @@ def load_model_and_tokenizer(
         model.generation_config.pad_token_id = (
             tokenizer.pad_token_id
         )
-
         model.generation_config.do_sample = False
         model.generation_config.temperature = None
         model.generation_config.top_p = None
 
-    model = model.to(device)
+    model = model.to(
+        device
+    )
     model.eval()
 
     return model, tokenizer
@@ -701,8 +732,7 @@ def generate_batch(
 
     inputs = {
         key: value.to(device)
-        for key, value
-        in inputs.items()
+        for key, value in inputs.items()
     }
 
     prompt_width = int(
@@ -792,11 +822,9 @@ def evaluate_split(
 
     if maximum_found > max_input_length:
         raise ValueError(
-            "Evaluation prompt exceeds the "
-            "configured input budget: "
-            f"{maximum_found} > "
-            f"{max_input_length}. Increase "
-            "--max_input_length."
+            "Evaluation prompt exceeds input "
+            f"budget: {maximum_found} > "
+            f"{max_input_length}."
         )
 
     order = sorted(
@@ -841,9 +869,10 @@ def evaluate_split(
         None
     ] * len(examples)
 
-    for sorted_index, original_index in enumerate(
-        order
-    ):
+    for (
+        sorted_index,
+        original_index,
+    ) in enumerate(order):
         outputs[original_index] = (
             sorted_outputs[sorted_index]
         )
@@ -869,7 +898,9 @@ def evaluate_split(
             predicted_bridges,
             predicted_answer,
             found_answer_label,
-        ) = parse_output(raw_output)
+        ) = parse_output(
+            raw_output
+        )
 
         gold_answers = get_gold_answers(
             example
@@ -937,18 +968,35 @@ def evaluate_split(
 
         detailed.append(
             {
-                "id": example.get("id", ""),
-                "hop": example.get("hop"),
+                "id": example.get(
+                    "id",
+                    "",
+                ),
+                "hop": example.get(
+                    "hop"
+                ),
                 "question": example.get(
                     "question",
                     "",
                 ),
-                "target_style": target_style,
-                "prompt_style": prompt_style,
-                "context_mode": context_mode,
-                "gold_bridges": gold_bridges,
-                "gold_answers": gold_answers,
-                "raw_output": raw_output,
+                "target_style": (
+                    target_style
+                ),
+                "prompt_style": (
+                    prompt_style
+                ),
+                "context_mode": (
+                    context_mode
+                ),
+                "gold_bridges": (
+                    gold_bridges
+                ),
+                "gold_answers": (
+                    gold_answers
+                ),
+                "raw_output": (
+                    raw_output
+                ),
                 "predicted_bridges": (
                     predicted_bridges
                 ),
@@ -979,7 +1027,9 @@ def evaluate_split(
             }
         )
 
-    number_examples = len(examples)
+    number_examples = len(
+        examples
+    )
 
     if number_examples == 0:
         raise ValueError(
@@ -1100,7 +1150,9 @@ def write_csv(
     for row in rows:
         for key in row:
             if key not in fieldnames:
-                fieldnames.append(key)
+                fieldnames.append(
+                    key
+                )
 
     with path.open(
         "w",
@@ -1113,7 +1165,9 @@ def write_csv(
         )
 
         writer.writeheader()
-        writer.writerows(rows)
+        writer.writerows(
+            rows
+        )
 
 
 def print_metrics(
@@ -1126,12 +1180,18 @@ def print_metrics(
         f"N={metrics['n']} "
         f"EM={metrics['em']:.2f} "
         f"F1={metrics['f1']:.2f} "
-        f"Format={metrics['answer_format_rate']:.2f} "
-        f"BridgeR={metrics['bridge_recall']:.2f} "
-        f"BridgeF1={metrics['bridge_f1']:.2f} "
-        f"BridgeCount={metrics['bridge_count_accuracy']:.2f} "
-        f"ChainEM={metrics['chain_em']:.2f} "
-        f"PredBridges={metrics['mean_predicted_bridges']:.2f}"
+        f"Format="
+        f"{metrics['answer_format_rate']:.2f} "
+        f"BridgeR="
+        f"{metrics['bridge_recall']:.2f} "
+        f"BridgeF1="
+        f"{metrics['bridge_f1']:.2f} "
+        f"BridgeCount="
+        f"{metrics['bridge_count_accuracy']:.2f} "
+        f"ChainEM="
+        f"{metrics['chain_em']:.2f} "
+        f"PredBridges="
+        f"{metrics['mean_predicted_bridges']:.2f}"
     )
 
 
@@ -1165,22 +1225,23 @@ def flatten_run_summaries(
             summary["results"].items()
         ):
             row = {
-                "run_name": summary[
-                    "run_name"
-                ],
-                "model_dir": summary[
-                    "model_dir"
-                ],
-                "base_key": experiment.get(
-                    "base_key",
+                "run_name": (
+                    summary["run_name"]
+                ),
+                "model_dir": (
+                    summary["model_dir"]
+                ),
+                "base_key": (
+                    experiment.get(
+                        "base_key",
+                        "unknown",
+                    )
+                ),
+                "model_name": (
                     experiment.get(
                         "model_name",
                         "unknown",
-                    ),
-                ),
-                "model_name": experiment.get(
-                    "model_name",
-                    "unknown",
+                    )
                 ),
                 "seed": experiment.get(
                     "seed",
@@ -1205,8 +1266,12 @@ def flatten_run_summaries(
                 "split": split,
             }
 
-            row.update(metrics)
-            rows.append(row)
+            row.update(
+                metrics
+            )
+            rows.append(
+                row
+            )
 
     return rows
 
@@ -1214,7 +1279,9 @@ def flatten_run_summaries(
 def aggregate_result_rows(
     rows: List[Dict],
 ) -> List[Dict]:
-    groups = defaultdict(list)
+    groups = defaultdict(
+        list
+    )
 
     for row in rows:
         key = (
@@ -1226,7 +1293,9 @@ def aggregate_result_rows(
             row["split"],
         )
 
-        groups[key].append(row)
+        groups[key].append(
+            row
+        )
 
     aggregated: List[Dict] = []
 
@@ -1245,9 +1314,15 @@ def aggregate_result_rows(
         output = {
             "base_key": base_key,
             "model_name": model_name,
-            "target_style": target_style,
-            "prompt_style": prompt_style,
-            "context_mode": context_mode,
+            "target_style": (
+                target_style
+            ),
+            "prompt_style": (
+                prompt_style
+            ),
+            "context_mode": (
+                context_mode
+            ),
             "split": split,
             "number_runs": len(
                 group_rows
@@ -1258,18 +1333,7 @@ def aggregate_result_rows(
             values = [
                 float(row[metric])
                 for row in group_rows
-                if row.get(metric)
-                is not None
             ]
-
-            if not values:
-                output[
-                    f"{metric}_mean"
-                ] = None
-                output[
-                    f"{metric}_std"
-                ] = None
-                continue
 
             output[
                 f"{metric}_mean"
@@ -1287,7 +1351,9 @@ def aggregate_result_rows(
                 else 0.0
             )
 
-        aggregated.append(output)
+        aggregated.append(
+            output
+        )
 
     return aggregated
 
@@ -1295,7 +1361,10 @@ def aggregate_result_rows(
 def build_contrasts(
     rows: List[Dict],
 ) -> List[Dict]:
-    index = {}
+    index: Dict[
+        Tuple,
+        Dict,
+    ] = {}
 
     for row in rows:
         key = (
@@ -1308,7 +1377,7 @@ def build_contrasts(
 
         index[key] = row
 
-    base_seed_split = sorted(
+    combinations = sorted(
         {
             (
                 row["base_key"],
@@ -1325,7 +1394,9 @@ def build_contrasts(
         base_key,
         seed,
         split,
-    ) in base_seed_split:
+    ) in combinations:
+        # Prompt anchoring:
+        # anchored - canonical, holding target supervision fixed.
         for target_style in [
             "answer_only",
             "bridge_aware",
@@ -1358,7 +1429,9 @@ def build_contrasts(
                     "contrast_type": (
                         "prompt_anchoring"
                     ),
-                    "base_key": base_key,
+                    "base_key": (
+                        base_key
+                    ),
                     "seed": seed,
                     "split": split,
                     "fixed_factor": (
@@ -1391,6 +1464,8 @@ def build_contrasts(
                     contrast
                 )
 
+        # Bridge supervision:
+        # bridge-aware - answer-only, holding prompt fixed.
         for prompt_style in [
             "canonical",
             "anchored",
@@ -1423,7 +1498,9 @@ def build_contrasts(
                     "contrast_type": (
                         "bridge_supervision"
                     ),
-                    "base_key": base_key,
+                    "base_key": (
+                        base_key
+                    ),
                     "seed": seed,
                     "split": split,
                     "fixed_factor": (
@@ -1466,7 +1543,9 @@ def build_contrasts(
 def aggregate_contrasts(
     contrasts: List[Dict],
 ) -> List[Dict]:
-    groups = defaultdict(list)
+    groups = defaultdict(
+        list
+    )
 
     for row in contrasts:
         key = (
@@ -1479,7 +1558,9 @@ def aggregate_contrasts(
             row["condition_b"],
         )
 
-        groups[key].append(row)
+        groups[key].append(
+            row
+        )
 
     aggregated: List[Dict] = []
 
@@ -1502,17 +1583,27 @@ def aggregate_contrasts(
             ),
             "base_key": base_key,
             "split": split,
-            "fixed_factor": fixed_factor,
-            "fixed_value": fixed_value,
-            "condition_a": condition_a,
-            "condition_b": condition_b,
+            "fixed_factor": (
+                fixed_factor
+            ),
+            "fixed_value": (
+                fixed_value
+            ),
+            "condition_a": (
+                condition_a
+            ),
+            "condition_b": (
+                condition_b
+            ),
             "number_seeds": len(
                 group_rows
             ),
         }
 
         for metric in METRIC_NAMES:
-            field = f"delta_{metric}"
+            field = (
+                f"delta_{metric}"
+            )
 
             values = [
                 float(row[field])
@@ -1535,7 +1626,9 @@ def aggregate_contrasts(
                 else 0.0
             )
 
-        aggregated.append(output)
+        aggregated.append(
+            output
+        )
 
     return aggregated
 
@@ -1544,17 +1637,28 @@ def print_final_tables(
     rows: List[Dict],
     contrasts: List[Dict],
 ) -> None:
-    print("\n" + "=" * 132)
-    print("FINAL MODEL RESULTS")
-    print("=" * 132)
+    print(
+        "\n" + "=" * 124
+    )
+    print(
+        "FINAL MODEL RESULTS"
+    )
+    print(
+        "=" * 124
+    )
 
     for split in sorted(
-        {row["split"] for row in rows}
+        {
+            row["split"]
+            for row in rows
+        }
     ):
-        print(f"\n--- {split} ---")
+        print(
+            f"\n--- {split} ---"
+        )
 
         print(
-            f"{'Base':<14}"
+            f"{'Base':<13}"
             f"{'Target':<15}"
             f"{'Prompt':<12}"
             f"{'Seed':>7}"
@@ -1565,7 +1669,9 @@ def print_final_tables(
             f"{'ChainEM':>11}"
         )
 
-        print("-" * 107)
+        print(
+            "-" * 101
+        )
 
         split_rows = sorted(
             [
@@ -1583,7 +1689,7 @@ def print_final_tables(
 
         for row in split_rows:
             print(
-                f"{row['base_key']:<14}"
+                f"{row['base_key']:<13}"
                 f"{row['target_style']:<15}"
                 f"{row['prompt_style']:<12}"
                 f"{int(row['seed']):>7}"
@@ -1594,13 +1700,19 @@ def print_final_tables(
                 f"{row['chain_em']:>11.2f}"
             )
 
-    print("\n" + "=" * 132)
-    print("PAIRED CONTRASTS")
+    print(
+        "\n" + "=" * 124
+    )
+    print(
+        "PAIRED CONTRASTS"
+    )
     print(
         "Positive delta means condition_b "
         "outperformed condition_a."
     )
-    print("=" * 132)
+    print(
+        "=" * 124
+    )
 
     for row in contrasts:
         print(
@@ -1611,9 +1723,11 @@ def print_final_tables(
             f"{row['fixed_value']:<13} "
             f"{row['condition_b']} - "
             f"{row['condition_a']}: "
-            f"ΔEM={row['delta_em']:+.2f}, "
-            f"ΔF1={row['delta_f1']:+.2f}, "
-            f"ΔBridgeR="
+            f"DeltaEM="
+            f"{row['delta_em']:+.2f}, "
+            f"DeltaF1="
+            f"{row['delta_f1']:+.2f}, "
+            f"DeltaBridgeR="
             f"{row['delta_bridge_recall']:+.2f}"
         )
 
@@ -1685,14 +1799,16 @@ def main() -> None:
 
             if missing_fields:
                 raise ValueError(
-                    "Missing experiment config "
-                    f"fields for {model_dir}: "
+                    "Missing experiment fields "
+                    f"for {model_dir}: "
                     f"{missing_fields}"
                 )
 
             run_name = experiment.get(
                 "run_name",
-                infer_run_name(model_dir),
+                infer_run_name(
+                    model_dir
+                ),
             )
 
             run_out_dir = (
@@ -1719,12 +1835,12 @@ def main() -> None:
                     "r",
                     encoding="utf-8",
                 ) as file:
-                    existing_summary = (
+                    previous_summary = (
                         json.load(file)
                     )
 
                 existing_results = dict(
-                    existing_summary.get(
+                    previous_summary.get(
                         "results",
                         {},
                     )
@@ -1743,9 +1859,15 @@ def main() -> None:
                 not in existing_results
             ]
 
-            print("\n" + "#" * 100)
-            print(f"Run          : {run_name}")
-            print(f"Model dir    : {model_dir}")
+            print(
+                "\n" + "#" * 100
+            )
+            print(
+                f"Run           : {run_name}"
+            )
+            print(
+                f"Model dir     : {model_dir}"
+            )
             print(
                 f"Base          : "
                 f"{experiment.get('base_key')}"
@@ -1766,7 +1888,9 @@ def main() -> None:
                 f"Missing splits: "
                 f"{missing_splits}"
             )
-            print("#" * 100)
+            print(
+                "#" * 100
+            )
 
             if missing_splits:
                 model, tokenizer = (
@@ -1860,29 +1984,35 @@ def main() -> None:
                     detailed,
                 )
 
-                partial_summary = {
-                    "run_name": run_name,
-                    "model_dir": str(
-                        model_dir
-                    ),
-                    "experiment": (
-                        experiment
-                    ),
-                    "results": (
-                        existing_results
-                    ),
-                }
-
                 write_json(
                     summary_path,
-                    partial_summary,
+                    {
+                        "run_name": (
+                            run_name
+                        ),
+                        "model_dir": str(
+                            model_dir
+                        ),
+                        "experiment": (
+                            experiment
+                        ),
+                        "results": (
+                            existing_results
+                        ),
+                    },
                 )
 
             run_summary = {
                 "run_name": run_name,
-                "model_dir": str(model_dir),
-                "experiment": experiment,
-                "results": existing_results,
+                "model_dir": str(
+                    model_dir
+                ),
+                "experiment": (
+                    experiment
+                ),
+                "results": (
+                    existing_results
+                ),
             }
 
             write_json(
@@ -1896,24 +2026,34 @@ def main() -> None:
 
         except Exception as error:
             failure = {
-                "model_dir": (
-                    str(model_dir)
+                "model_dir": str(
+                    model_dir
                 ),
-                "error": repr(error),
+                "error": repr(
+                    error
+                ),
                 "traceback": (
                     traceback.format_exc()
                 ),
             }
 
-            failures.append(failure)
+            failures.append(
+                failure
+            )
 
-            print("\n" + "!" * 100)
+            print(
+                "\n" + "!" * 100
+            )
             print(
                 f"EVALUATION FAILED: "
                 f"{model_dir}"
             )
-            print(failure["traceback"])
-            print("!" * 100)
+            print(
+                failure["traceback"]
+            )
+            print(
+                "!" * 100
+            )
 
         finally:
             free_model(
@@ -1942,7 +2082,8 @@ def main() -> None:
     )
 
     write_json(
-        out_dir / "all_results.json",
+        out_dir
+        / "all_results.json",
         {
             "runs": all_summaries,
             "failures": failures,
@@ -1950,17 +2091,20 @@ def main() -> None:
     )
 
     write_csv(
-        out_dir / "all_results.csv",
+        out_dir
+        / "all_results.csv",
         flat_rows,
     )
 
     write_csv(
-        out_dir / "aggregate_results.csv",
+        out_dir
+        / "aggregate_results.csv",
         aggregate_rows,
     )
 
     write_csv(
-        out_dir / "contrasts.csv",
+        out_dir
+        / "contrasts.csv",
         contrasts,
     )
 
@@ -1971,7 +2115,8 @@ def main() -> None:
     )
 
     write_json(
-        out_dir / "failures.json",
+        out_dir
+        / "failures.json",
         failures,
     )
 
@@ -1980,10 +2125,14 @@ def main() -> None:
         contrasts=contrasts,
     )
 
-    print("\nResults saved to:")
-    print(f"  {out_dir}")
     print(
-        "Main tables:\n"
+        "\nResults saved to:"
+    )
+    print(
+        f"  {out_dir}"
+    )
+    print(
+        "Main files:\n"
         f"  {out_dir / 'all_results.csv'}\n"
         f"  {out_dir / 'aggregate_results.csv'}\n"
         f"  {out_dir / 'contrasts.csv'}\n"

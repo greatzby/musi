@@ -4,20 +4,20 @@
 from __future__ import annotations
 
 import argparse
-import inspect
 import json
 import os
-import random
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional
 
+import numpy as np
 import torch
 import transformers
 from datasets import Dataset
 from datasets.utils.logging import disable_progress_bar
 from peft import LoraConfig, TaskType, get_peft_model
+from torch.distributed.elastic.multiprocessing.errors import record
 from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
@@ -90,13 +90,23 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--max_length",
         type=int,
-        default=2048,
+        default=4096,
     )
     parser.add_argument(
         "--max_steps",
         type=int,
         default=2000,
     )
+    parser.add_argument(
+        "--max_train_examples",
+        type=int,
+        default=0,
+        help=(
+            "If greater than zero, use only this many training examples. "
+            "Used primarily by the smoke test."
+        ),
+    )
+
     parser.add_argument(
         "--per_device_train_batch_size",
         type=int,
@@ -209,9 +219,7 @@ def parse_args() -> argparse.Namespace:
         "--resume_from_checkpoint",
         type=str,
         default="auto",
-        help=(
-            "'auto', 'none', or a checkpoint directory."
-        ),
+        help="'auto', 'none', or an explicit checkpoint path.",
     )
 
     parser.add_argument(
@@ -234,15 +242,21 @@ def parse_args() -> argparse.Namespace:
 
 
 def get_rank() -> int:
-    return int(os.environ.get("RANK", "0"))
+    return int(
+        os.environ.get("RANK", "0")
+    )
 
 
 def get_local_rank() -> int:
-    return int(os.environ.get("LOCAL_RANK", "0"))
+    return int(
+        os.environ.get("LOCAL_RANK", "0")
+    )
 
 
 def get_world_size() -> int:
-    return int(os.environ.get("WORLD_SIZE", "1"))
+    return int(
+        os.environ.get("WORLD_SIZE", "1")
+    )
 
 
 def is_main_process() -> bool:
@@ -299,12 +313,17 @@ def encode_example(
         add_generation_prompt=False,
     )
 
-    prompt_ids = list(map(int, prompt_ids))
-    full_ids = list(map(int, full_ids))
+    prompt_ids = list(
+        map(int, prompt_ids)
+    )
+    full_ids = list(
+        map(int, full_ids)
+    )
 
     if (
         len(full_ids) < len(prompt_ids)
-        or full_ids[:len(prompt_ids)] != prompt_ids
+        or full_ids[:len(prompt_ids)]
+        != prompt_ids
     ):
         example_id = example.get(
             "id",
@@ -314,8 +333,8 @@ def encode_example(
         raise RuntimeError(
             "Chat-template prefix mismatch for "
             f"example {example_id}. The tokenized "
-            "generation prompt is not a prefix of the "
-            "complete training conversation."
+            "generation prompt is not a prefix of "
+            "the complete training conversation."
         )
 
     if len(full_ids) > max_length:
@@ -327,9 +346,7 @@ def encode_example(
         raise ValueError(
             f"Example {example_id} has "
             f"{len(full_ids)} tokens, exceeding "
-            f"max_length={max_length}. Increase "
-            "--max_length rather than silently "
-            "truncating the question or answer."
+            f"max_length={max_length}."
         )
 
     labels = (
@@ -342,7 +359,7 @@ def encode_example(
         for label in labels
     ):
         raise RuntimeError(
-            "Encoded example has no supervised tokens."
+            "Encoded example has no supervised target tokens."
         )
 
     return {
@@ -352,7 +369,8 @@ def encode_example(
         "length": len(full_ids),
         "prompt_length": len(prompt_ids),
         "target_length": (
-            len(full_ids) - len(prompt_ids)
+            len(full_ids)
+            - len(prompt_ids)
         ),
     }
 
@@ -412,36 +430,10 @@ class SupervisedDataCollator:
         }
 
 
-def build_trainer(
-    model,
-    tokenizer,
-    training_args: TrainingArguments,
-    train_dataset: Dataset,
-    data_collator: SupervisedDataCollator,
-) -> Trainer:
-    kwargs = {
-        "model": model,
-        "args": training_args,
-        "train_dataset": train_dataset,
-        "data_collator": data_collator,
-    }
-
-    signature = inspect.signature(
-        Trainer.__init__
-    )
-
-    if (
-        "processing_class"
-        in signature.parameters
-    ):
-        kwargs["processing_class"] = tokenizer
-    else:
-        kwargs["tokenizer"] = tokenizer
-
-    return Trainer(**kwargs)
-
-
 def make_json_safe(value):
+    if isinstance(value, np.generic):
+        return value.item()
+
     if isinstance(value, torch.Tensor):
         if value.numel() == 1:
             return value.detach().cpu().item()
@@ -461,39 +453,6 @@ def make_json_safe(value):
         ]
 
     return value
-
-
-def resolve_resume_checkpoint(
-    output_dir: Path,
-    requested: str,
-) -> Optional[str]:
-    normalized = requested.strip().lower()
-
-    if normalized in {
-        "",
-        "none",
-        "false",
-        "no",
-    }:
-        return None
-
-    if normalized == "auto":
-        checkpoint = get_last_checkpoint(
-            str(output_dir)
-        )
-
-        return checkpoint
-
-    checkpoint_path = Path(
-        requested
-    ).expanduser().resolve()
-
-    if not checkpoint_path.exists():
-        raise FileNotFoundError(
-            checkpoint_path
-        )
-
-    return str(checkpoint_path)
 
 
 def write_json(
@@ -517,6 +476,40 @@ def write_json(
         )
 
 
+def resolve_resume_checkpoint(
+    output_dir: Path,
+    requested: str,
+) -> Optional[str]:
+    normalized = (
+        requested.strip().lower()
+    )
+
+    if normalized in {
+        "",
+        "none",
+        "false",
+        "no",
+    }:
+        return None
+
+    if normalized == "auto":
+        return get_last_checkpoint(
+            str(output_dir)
+        )
+
+    checkpoint_path = Path(
+        requested
+    ).expanduser().resolve()
+
+    if not checkpoint_path.exists():
+        raise FileNotFoundError(
+            checkpoint_path
+        )
+
+    return str(checkpoint_path)
+
+
+@record
 def main() -> None:
     args = parse_args()
 
@@ -527,15 +520,18 @@ def main() -> None:
     if not is_main_process():
         disable_progress_bar()
 
-    random.seed(args.seed + rank)
-    set_seed(args.seed)
-
     if not torch.cuda.is_available():
         raise RuntimeError(
             "CUDA is required."
         )
 
-    torch.cuda.set_device(local_rank)
+    torch.cuda.set_device(
+        local_rank
+    )
+
+    set_seed(
+        args.seed
+    )
 
     if (
         args.dtype == "bf16"
@@ -563,15 +559,20 @@ def main() -> None:
         args.output_dir
     ).expanduser().resolve()
 
-    final_dir = output_dir / "final"
+    final_dir = (
+        output_dir / "final"
+    )
 
     if not train_path.exists():
-        raise FileNotFoundError(train_path)
+        raise FileNotFoundError(
+            train_path
+        )
 
     if final_dir.exists():
         main_print(
             f"Completed model already exists: "
-            f"{final_dir}\nSkipping training."
+            f"{final_dir}\n"
+            "Skipping training."
         )
         return
 
@@ -589,43 +590,77 @@ def main() -> None:
     main_print("=" * 92)
     main_print("MuSiQue controlled SFT")
     main_print("=" * 92)
-    main_print(f"Base key            : {args.base_key}")
-    main_print(f"Model               : {args.model_name}")
-    main_print(f"Target style        : {args.target_style}")
-    main_print(f"Prompt style        : {args.prompt_style}")
-    main_print(f"Context mode        : {args.context_mode}")
-    main_print(f"Training file       : {train_path}")
-    main_print(f"Output              : {output_dir}")
-    main_print(f"World size          : {world_size}")
     main_print(
-        f"Per-device batch    : "
+        f"Base key              : "
+        f"{args.base_key}"
+    )
+    main_print(
+        f"Model                 : "
+        f"{args.model_name}"
+    )
+    main_print(
+        f"Target style          : "
+        f"{args.target_style}"
+    )
+    main_print(
+        f"Prompt style          : "
+        f"{args.prompt_style}"
+    )
+    main_print(
+        f"Context mode          : "
+        f"{args.context_mode}"
+    )
+    main_print(
+        f"Training file         : "
+        f"{train_path}"
+    )
+    main_print(
+        f"Output                : "
+        f"{output_dir}"
+    )
+    main_print(
+        f"World size            : "
+        f"{world_size}"
+    )
+    main_print(
+        f"Per-device batch      : "
         f"{args.per_device_train_batch_size}"
     )
     main_print(
-        f"Gradient accumulation: "
+        f"Gradient accumulation : "
         f"{args.gradient_accumulation_steps}"
     )
     main_print(
-        f"Global batch        : "
+        f"Global batch          : "
         f"{global_batch_size}"
     )
     main_print(
-        f"Maximum steps       : "
+        f"Maximum length        : "
+        f"{args.max_length}"
+    )
+    main_print(
+        f"Maximum steps         : "
         f"{args.max_steps}"
     )
     main_print(
-        f"Learning rate       : "
+        f"Learning rate         : "
         f"{args.learning_rate}"
     )
     main_print(
-        f"Warmup steps        : "
+        f"Warmup steps          : "
         f"{args.warmup_steps}"
+    )
+    main_print(
+        f"Local files only      : "
+        f"{args.local_files_only}"
     )
     main_print("=" * 92)
 
     print(
-        f"[rank={rank} local_rank={local_rank}] "
-        f"CUDA device={torch.cuda.current_device()}",
+        f"[rank={rank} "
+        f"local_rank={local_rank}] "
+        f"CUDA device="
+        f"{torch.cuda.current_device()}",
         flush=True,
     )
 
@@ -633,7 +668,9 @@ def main() -> None:
         args.model_name,
         use_fast=True,
         trust_remote_code=True,
-        local_files_only=args.local_files_only,
+        local_files_only=(
+            args.local_files_only
+        ),
     )
 
     chat_template_status = (
@@ -642,35 +679,41 @@ def main() -> None:
         )
     )
 
-    number_added_tokens = ensure_pad_token(
-        tokenizer
+    number_added_tokens = (
+        ensure_pad_token(
+            tokenizer
+        )
     )
 
     tokenizer.padding_side = "right"
     tokenizer.truncation_side = "right"
 
     main_print(
-        f"Chat template       : "
+        f"Chat template         : "
         f"{chat_template_status}"
     )
     main_print(
-        f"PAD token           : "
+        f"Tokenizer length      : "
+        f"{len(tokenizer)}"
+    )
+    main_print(
+        f"PAD token             : "
         f"{tokenizer.pad_token!r}"
     )
     main_print(
-        f"PAD token ID        : "
+        f"PAD token ID          : "
         f"{tokenizer.pad_token_id}"
     )
     main_print(
-        f"EOS token           : "
+        f"EOS token             : "
         f"{tokenizer.eos_token!r}"
     )
     main_print(
-        f"EOS token ID        : "
+        f"EOS token ID          : "
         f"{tokenizer.eos_token_id}"
     )
     main_print(
-        f"New vocabulary tokens: "
+        f"New vocabulary tokens : "
         f"{number_added_tokens}"
     )
 
@@ -678,13 +721,28 @@ def main() -> None:
         train_path
     )
 
+    if args.max_train_examples > 0:
+        raw_examples = raw_examples[
+            :args.max_train_examples
+        ]
+
+    if not raw_examples:
+        raise ValueError(
+            "Training dataset is empty."
+        )
+
     main_print(
-        f"Loaded examples     : "
+        f"Loaded examples       : "
         f"{len(raw_examples)}"
     )
 
     bridge_distribution = Counter(
-        len(example.get("bridges", []))
+        len(
+            example.get(
+                "bridges",
+                [],
+            )
+        )
         for example in raw_examples
     )
 
@@ -714,6 +772,8 @@ def main() -> None:
         ),
         remove_columns=raw_dataset.column_names,
         num_proc=map_num_proc,
+        load_from_cache_file=False,
+        keep_in_memory=True,
         desc=(
             "Tokenizing"
             if is_main_process()
@@ -721,7 +781,9 @@ def main() -> None:
         ),
     )
 
-    lengths = encoded_dataset["length"]
+    lengths = (
+        encoded_dataset["length"]
+    )
     prompt_lengths = (
         encoded_dataset["prompt_length"]
     )
@@ -729,42 +791,50 @@ def main() -> None:
         encoded_dataset["target_length"]
     )
 
-    estimated_epochs = effective_training_epochs(
-        max_steps=args.max_steps,
-        global_batch_size=global_batch_size,
-        number_examples=len(encoded_dataset),
+    estimated_epochs = (
+        effective_training_epochs(
+            max_steps=args.max_steps,
+            global_batch_size=(
+                global_batch_size
+            ),
+            number_examples=len(
+                encoded_dataset
+            ),
+        )
     )
 
     main_print(
-        f"Encoded examples    : "
+        f"Encoded examples      : "
         f"{len(encoded_dataset)}"
     )
     main_print(
-        f"Minimum length      : "
+        f"Minimum length        : "
         f"{min(lengths)}"
     )
     main_print(
-        f"Maximum length      : "
+        f"Maximum length        : "
         f"{max(lengths)}"
     )
     main_print(
-        "Mean total length   : "
+        "Mean total length     : "
         f"{sum(lengths) / len(lengths):.1f}"
     )
     main_print(
-        "Mean prompt length  : "
+        "Mean prompt length    : "
         f"{sum(prompt_lengths) / len(prompt_lengths):.1f}"
     )
     main_print(
-        "Mean target length  : "
+        "Mean target length    : "
         f"{sum(target_lengths) / len(target_lengths):.1f}"
     )
     main_print(
-        "Approximate epochs  : "
+        "Approximate epochs    : "
         f"{estimated_epochs:.3f}"
     )
 
-    first_example = encoded_dataset[0]
+    first_example = (
+        encoded_dataset[0]
+    )
 
     first_prompt_ids = first_example[
         "input_ids"
@@ -774,25 +844,22 @@ def main() -> None:
         "input_ids"
     ][first_example["prompt_length"]:]
 
-    decoded_prompt = tokenizer.decode(
-        first_prompt_ids,
-        skip_special_tokens=False,
-        clean_up_tokenization_spaces=False,
-    )
-
-    decoded_target = tokenizer.decode(
-        first_target_ids,
-        skip_special_tokens=False,
-        clean_up_tokenization_spaces=False,
-    )
-
     main_print(
         "\nFirst prompt ending:\n"
-        + decoded_prompt[-1800:]
+        + tokenizer.decode(
+            first_prompt_ids,
+            skip_special_tokens=False,
+            clean_up_tokenization_spaces=False,
+        )[-1800:]
     )
+
     main_print(
         "\nFirst supervised target:\n"
-        + decoded_target
+        + tokenizer.decode(
+            first_target_ids,
+            skip_special_tokens=False,
+            clean_up_tokenization_spaces=False,
+        )
     )
 
     model = AutoModelForCausalLM.from_pretrained(
@@ -805,20 +872,47 @@ def main() -> None:
         ),
         trust_remote_code=True,
         low_cpu_mem_usage=True,
-        local_files_only=args.local_files_only,
+        local_files_only=(
+            args.local_files_only
+        ),
     )
+
+    maximum_positions = getattr(
+        model.config,
+        "max_position_embeddings",
+        None,
+    )
+
+    if (
+        maximum_positions is not None
+        and args.max_length
+        > int(maximum_positions)
+    ):
+        raise ValueError(
+            f"Configured max_length="
+            f"{args.max_length} exceeds "
+            f"max_position_embeddings="
+            f"{maximum_positions}."
+        )
 
     original_vocabulary_size = int(
         model.get_input_embeddings()
         .weight.shape[0]
     )
 
+    main_print(
+        f"Model embedding rows  : "
+        f"{original_vocabulary_size}"
+    )
+
+    embeddings_expanded = False
+
     if (
-        original_vocabulary_size
-        != len(tokenizer)
+        len(tokenizer)
+        > original_vocabulary_size
     ):
         main_print(
-            "Resizing token embeddings: "
+            "Expanding token embeddings: "
             f"{original_vocabulary_size} "
             f"-> {len(tokenizer)}"
         )
@@ -827,14 +921,55 @@ def main() -> None:
             len(tokenizer)
         )
 
+        embeddings_expanded = True
+
+    elif (
+        len(tokenizer)
+        < original_vocabulary_size
+    ):
+        main_print(
+            "Keeping model vocabulary unchanged: "
+            f"model={original_vocabulary_size}, "
+            f"tokenizer={len(tokenizer)}. "
+            "No embedding rows will be removed."
+        )
+
+    else:
+        main_print(
+            "Tokenizer and model vocabulary "
+            "sizes match."
+        )
+
     model.config.pad_token_id = (
         tokenizer.pad_token_id
     )
     model.config.use_cache = False
 
-    modules_to_save: Optional[List[str]] = None
+    if tokenizer.eos_token_id is not None:
+        model.config.eos_token_id = (
+            tokenizer.eos_token_id
+        )
 
-    if number_added_tokens > 0:
+    if (
+        hasattr(
+            model,
+            "generation_config",
+        )
+        and model.generation_config
+        is not None
+    ):
+        model.generation_config.pad_token_id = (
+            tokenizer.pad_token_id
+        )
+
+    modules_to_save: Optional[
+        List[str]
+    ] = None
+
+    if (
+        number_added_tokens > 0
+        or embeddings_expanded
+    ):
         modules_to_save = [
             "embed_tokens",
             "lm_head",
@@ -914,7 +1049,6 @@ def main() -> None:
         logging_strategy="steps",
         logging_steps=args.logging_steps,
         logging_first_step=True,
-        log_on_each_node=False,
 
         save_strategy="steps",
         save_steps=args.save_steps,
@@ -922,7 +1056,6 @@ def main() -> None:
             args.save_total_limit
         ),
         save_safetensors=True,
-        save_on_each_node=False,
 
         report_to="none",
 
@@ -947,14 +1080,15 @@ def main() -> None:
         disable_tqdm=not is_main_process(),
     )
 
-    trainer = build_trainer(
+    trainer = Trainer(
         model=model,
-        tokenizer=tokenizer,
-        training_args=training_args,
+        args=training_args,
         train_dataset=encoded_dataset,
-        data_collator=SupervisedDataCollator(
-            pad_token_id=int(
-                tokenizer.pad_token_id
+        data_collator=(
+            SupervisedDataCollator(
+                pad_token_id=int(
+                    tokenizer.pad_token_id
+                )
             )
         ),
     )
@@ -969,7 +1103,7 @@ def main() -> None:
     )
 
     main_print(
-        f"Resume checkpoint   : "
+        f"Resume checkpoint     : "
         f"{resume_checkpoint}"
     )
 
@@ -982,7 +1116,9 @@ def main() -> None:
         "output_dir_resolved": str(
             output_dir
         ),
-        "final_dir": str(final_dir),
+        "final_dir": str(
+            final_dir
+        ),
         "world_size": world_size,
         "effective_global_batch_size": (
             global_batch_size
@@ -993,10 +1129,15 @@ def main() -> None:
         "approximate_epochs": (
             estimated_epochs
         ),
-        "minimum_length": min(lengths),
-        "maximum_length": max(lengths),
+        "minimum_length": min(
+            lengths
+        ),
+        "maximum_length": max(
+            lengths
+        ),
         "mean_length": (
-            sum(lengths) / len(lengths)
+            sum(lengths)
+            / len(lengths)
         ),
         "mean_prompt_length": (
             sum(prompt_lengths)
@@ -1014,11 +1155,23 @@ def main() -> None:
         "chat_template_status": (
             chat_template_status
         ),
+        "tokenizer_length": len(
+            tokenizer
+        ),
+        "original_model_embedding_rows": (
+            original_vocabulary_size
+        ),
+        "embeddings_expanded": (
+            embeddings_expanded
+        ),
         "pad_token_id": (
             tokenizer.pad_token_id
         ),
         "eos_token_id": (
             tokenizer.eos_token_id
+        ),
+        "max_position_embeddings": (
+            maximum_positions
         ),
         "system_prompt": (
             build_system_prompt(
@@ -1026,7 +1179,7 @@ def main() -> None:
             )
         ),
         "prompt_protocol_version": (
-            "goal_anchor_factorial_v1"
+            "goal_anchor_factorial_v3"
         ),
         "versions": {
             "torch": torch.__version__,
@@ -1082,7 +1235,9 @@ def main() -> None:
 
         print("\n" + "=" * 92)
         print("Training complete")
-        print(f"Final model: {final_dir}")
+        print(
+            f"Final model: {final_dir}"
+        )
         print("=" * 92)
 
     trainer.accelerator.wait_for_everyone()

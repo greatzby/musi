@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List
 
 
 LLAMA3_CHAT_TEMPLATE = r"""
@@ -33,8 +33,8 @@ QWEN_CHAT_TEMPLATE = r"""
 """
 
 
-# 该输出格式在 answer-only / bridge-aware 之间完全相同。
-# 唯一不同之处是训练 target 中是否真的包含 Bridge 行。
+# This output schema is identical for answer-only and bridge-aware.
+# Therefore output-format instructions are not confounded with target labels.
 COMMON_OUTPUT_SCHEMA = (
     "Response format:\n"
     "- You may output zero or more intermediate bridge lines in dependency "
@@ -50,14 +50,13 @@ CANONICAL_INSTRUCTION = (
 )
 
 
-ANCHORED_INSTRUCTION = (
-    "Use only information from the supplied passages to answer the exact "
-    "target question.\n"
-    "The question labeled 'Question:' is the goal. Keep that exact goal in "
-    "focus while producing any intermediate bridges. Intermediate bridge "
-    "answers are only steps and must not replace the requested final answer.\n"
-    "Before stopping, verify that the final Answer line directly answers the "
-    "exact target question."
+# Anchored = canonical task instruction + redundant goal-conditioning cues.
+ANCHORING_ADDITION = (
+    "Treat the question labeled 'Question:' as the exact target goal. "
+    "Keep conditioning on that same target while producing any intermediate "
+    "bridges. Intermediate bridge answers are only supporting steps and must "
+    "not replace the requested final answer. Before stopping, verify that the "
+    "final Answer line directly answers the exact target question."
 )
 
 
@@ -76,11 +75,15 @@ def load_jsonl(path: Path) -> List[Dict]:
 
 def install_chat_template_if_needed(tokenizer) -> str:
     """
-    Return:
+    Install a fallback chat template only if the tokenizer does not
+    already provide one.
+
+    Returns:
         existing
         installed_qwen
         installed_llama
     """
+
     if tokenizer.chat_template:
         return "existing"
 
@@ -102,19 +105,19 @@ def install_chat_template_if_needed(tokenizer) -> str:
         return "installed_llama"
 
     raise RuntimeError(
-        "Tokenizer has no chat template and its vocabulary does not "
-        "look like either Qwen ChatML or Llama-3. Please install an "
-        "appropriate chat template explicitly."
+        "The tokenizer has no chat template and does not look like "
+        "Qwen ChatML or Llama-3."
     )
 
 
 def ensure_pad_token(tokenizer) -> int:
     """
-    Ensure that a pad token exists.
+    Ensure a PAD token exists.
 
     Returns:
-        Number of newly added vocabulary tokens.
+        Number of newly added vocabulary entries.
     """
+
     if tokenizer.pad_token_id is not None:
         return 0
 
@@ -145,8 +148,13 @@ def ensure_pad_token(tokenizer) -> int:
 def build_system_prompt(prompt_style: str) -> str:
     if prompt_style == "canonical":
         instruction = CANONICAL_INSTRUCTION
+
     elif prompt_style == "anchored":
-        instruction = ANCHORED_INSTRUCTION
+        instruction = (
+            f"{CANONICAL_INSTRUCTION}\n"
+            f"{ANCHORING_ADDITION}"
+        )
+
     else:
         raise ValueError(
             f"Unknown prompt_style: {prompt_style}"
@@ -245,6 +253,8 @@ def format_user_content(
         f"Question: {question}"
     )
 
+    # Prompt-side anchoring:
+    # repeat the target question without changing the target output.
     if prompt_style == "anchored":
         content += (
             "\n\n"
@@ -354,7 +364,9 @@ def load_experiment_config(
     return {}
 
 
-def infer_run_name(model_dir: Path) -> str:
+def infer_run_name(
+    model_dir: Path,
+) -> str:
     if model_dir.name == "final":
         return model_dir.parent.name
 
